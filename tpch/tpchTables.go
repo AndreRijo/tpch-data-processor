@@ -289,7 +289,7 @@ func (date *Date) IsHigher(otherDate *Date) bool {
 
 func (date *Date) CalculateDate(nDaysOffset int) (newDate *Date) {
 	dateT := time.Date(int(date.YEAR), time.Month(int(date.MONTH)), int(date.DAY), 0, 0, 0, 0, time.UTC)
-	dateT.AddDate(0, 0, nDaysOffset)
+	dateT = dateT.AddDate(0, 0, nDaysOffset)
 	return &Date{YEAR: int16(dateT.Year()), MONTH: int8(dateT.Month()), DAY: int8(dateT.Day())}
 }
 
