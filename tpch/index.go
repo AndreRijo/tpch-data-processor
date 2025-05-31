@@ -1,6 +1,7 @@
 package tpch
 
 import (
+	"encoding/binary"
 	"fmt"
 	"potionDB/crdt/crdt"
 	"potionDB/crdt/proto"
@@ -47,25 +48,30 @@ type PairIntFloat struct {
 	second int64
 }
 
+type PairUpdsNUpds struct {
+	upds  []crdt.UpdateObjectParams
+	nUpds int
+}
+
 // Idea: allow concurrent goroutines to use different versions of Orders and Lineitems table
 type TableInfo struct {
 	*Tables
 }
 
 type Q1Data struct {
-	sumQuantity, nItems                            int //avg can be calculated from sums and nItems
-	sumPrice, sumDiscPrice, sumCharge, sumDiscount float64
+	SumQuantity, NItems                            int //avg can be calculated from sums and nItems
+	SumPrice, SumDiscPrice, SumCharge, SumDiscount float64
 }
 
 type Q8YearPair struct {
 	sum1995, sum1996 float64
 }
 
-type Q13Info struct {
-	custToNOrders      map[int32]int8            //cust->nOrders
-	wordsToCustNOrders map[string]map[int32]int8 //cust->nOrders with word1word2
+type Q13Info struct { //Arrays represent all customers. Their IDs go from 1 to n, so the first position is empty (just as in tpchTables.go)
+	custToNOrders      []int8            //cust->nOrders. Total number of orders of each customer, without considering words.
+	wordsToCustNOrders map[string][]int8 //word1word -> cust->nOrders (WITH word1word2). This only contains the nOrders referring to that specific combination of words!
 	//nOrders            map[int8]int32            //nOrders -> how many customers
-	wordsToNOrders map[string]map[int8]int32 //nOrders WITHOUT word1word2 -> how many customers
+	wordsToNOrders map[string]map[int8]int32 //nOrders WITHOUT word1word2 -> how many customers. Effectively the diff between custToNOrders and wordsToCustNOrders
 }
 
 type Q16Info struct {
@@ -87,7 +93,7 @@ const (
 	//Q17_AVG, Q17_TOP                                   = "a", "t"
 	Q17_AVG, Q17_MAP                             = "a", "m"
 	Q20_NAME, Q20_ADDRESS, Q20_AVAILQTY, Q20_SUM = "N", "A", "Q", "S"
-	Q22_AVG                                      = "AVG"
+	Q22_AVG, Q22_ARRAY_KEY, Q22_SPLIT_FACTOR     = "AVG", "AR", 100
 	INDEX_BKT                                    = 6
 
 	//For now, duplicated from tpchClient.go
@@ -118,6 +124,7 @@ var (
 	Q19_QUANTITY   = [41]string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
 		"21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40"}
 	q22CustNatBalances map[int8]PairIntFloat
+	q22CustMap         map[int32]int32 //custkey -> nOrders
 
 	prepIndexFuncs      []func() ([]crdt.UpdateObjectParams, int)     //Functions that prepare the index's initial data
 	prepIndexLocalFuncs []func() ([][]crdt.UpdateObjectParams, []int) //Functions  that prepare the local version of index's initial data
@@ -127,6 +134,7 @@ var (
 
 func InitializeIndexInfo(cfg IndexConfigs, tables *Tables) {
 	iCfg, ti = cfg, &TableInfo{Tables: tables}
+	time.Sleep(100 * time.Millisecond) //ensure ti gets shared between routines.
 	if iCfg.IsGlobal {
 		Buckets = append(Buckets, "INDEX")
 		ti.setPrepIndexFuncs()
@@ -298,7 +306,8 @@ func (ti TableInfo) setPrepIndexFuncs() {
 		case "19":
 			prepIndexFuncs[i] = ti.prepareQ19Index
 		case "20":
-			prepIndexFuncs[i] = ti.prepareQ20Index
+			//prepIndexFuncs[i] = ti.prepareQ20Index
+			prepIndexFuncs[i] = ti.prepareQ20IndexTopSum
 		case "21":
 			prepIndexFuncs[i] = ti.prepareQ21Index
 		case "22":
@@ -352,7 +361,8 @@ func (ti TableInfo) setLocalPrepIndexFuncs() {
 		case "19":
 			prepIndexLocalFuncs[i] = ti.prepareQ19IndexLocal
 		case "20":
-			prepIndexLocalFuncs[i] = ti.prepareQ20IndexLocal
+			//prepIndexLocalFuncs[i] = ti.prepareQ20IndexLocal
+			prepIndexLocalFuncs[i] = ti.prepareQ20IndexLocalTopSum
 		case "21":
 			prepIndexLocalFuncs[i] = ti.prepareQ21IndexLocal
 		case "22":
@@ -830,17 +840,17 @@ func (ti TableInfo) prepareQ15Index() (upds []crdt.UpdateObjectParams, updsDone 
 		ti.q15CalcHelper(orderItems, yearMap)
 	}
 
-	fmt.Println("[Index][Q15]NUpds before starting counting:", nUpds)
+	//fmt.Println("[Index][Q15]NUpds before starting counting:", nUpds)
 	for year := int16(1993); year <= 1997; year++ {
 		for month := int8(1); month <= 12; month += 3 {
 			nUpds += len(yearMap[year][month])
-			fmt.Printf("[Index][Q15]NUpds while counting: %d. Year, month: %d, %d. NUpds this quarter: %d\n",
-				nUpds, year, month, len(yearMap[year][month]))
+			//fmt.Printf("[Index][Q15]NUpds while counting: %d. Year, month: %d, %d. NUpds this quarter: %d\n",
+			//nUpds, year, month, len(yearMap[year][month]))
 		}
 	}
-	fmt.Println("[Index][Q15]NUpds after counting finishes:", nUpds)
+	//fmt.Println("[Index][Q15]NUpds after counting finishes:", nUpds)
 	nUpds += 20 //4 quarters, 5 years -> 20 TopK inits
-	fmt.Println("[Index][Q15]NUpds after counting finishes and with TopK inits:", nUpds)
+	//fmt.Println("[Index][Q15]NUpds after counting finishes and with TopK inits:", nUpds)
 
 	if !iCfg.UseTopSum {
 		fmt.Println("[TPCH_INDEX]Not using topsum to prepare q15 index")
@@ -1269,7 +1279,7 @@ func (ti TableInfo) makeQ15IndexUpdsTopSum(yearMap map[int16]map[int8]map[int32]
 				CrdtType: proto.CRDTType_TOPSUM,
 				Bucket:   Buckets[bucketI],
 			}
-			upds[i] = crdt.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: crdt.TopKInit{TopSize: 5}}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: crdt.TopSInit(5)}
 			i++
 			if !iCfg.UseTopKAll {
 				for suppKey, value := range monthMap[month] {
@@ -1512,29 +1522,29 @@ func q1CalcHelper(q1Map map[int8]map[string]*Q1Data, order *Orders, orderItems [
 		shipdate := item.L_SHIPDATE
 		if shipdate.IsLowerOrEqual(MIN_DATE_Q1) {
 			currData = q1Map[120][item.L_RETURNFLAG+item.L_LINESTATUS]
-			if currData.sumQuantity == 0 {
+			if currData.SumQuantity == 0 {
 				nUpds += 8
 			}
-			currData.sumQuantity += int(item.L_QUANTITY)
-			currData.sumPrice += item.L_EXTENDEDPRICE
-			currData.sumDiscount += item.L_DISCOUNT
-			currData.sumDiscPrice += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT))
-			currData.sumCharge += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT) * (1 + item.L_TAX))
-			currData.nItems++
+			currData.SumQuantity += int(item.L_QUANTITY)
+			currData.SumPrice += item.L_EXTENDEDPRICE
+			currData.SumDiscount += item.L_DISCOUNT
+			currData.SumDiscPrice += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT))
+			currData.SumCharge += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT) * (1 + item.L_TAX))
+			currData.NItems++
 			//fmt.Printf("Q1CalcHelper. Key: %v, Data: %v\n", item.L_RETURNFLAG+item.L_LINESTATUS, *currData)
 		} else if shipdate.IsLowerOrEqual(MAX_DATE_Q1) {
 			startPos := int8(60 + MAX_DATE_Q1.CalculateDiffDate(&shipdate))
 			for ; startPos >= 60; startPos-- {
 				currData = q1Map[startPos][item.L_RETURNFLAG+item.L_LINESTATUS]
-				if currData.sumQuantity == 0 {
+				if currData.SumQuantity == 0 {
 					nUpds += 8
 				}
-				currData.sumQuantity += int(item.L_QUANTITY)
-				currData.sumPrice += item.L_EXTENDEDPRICE
-				currData.sumDiscount += item.L_DISCOUNT
-				currData.sumDiscPrice += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT))
-				currData.sumCharge += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT) * (1 + item.L_TAX))
-				currData.nItems++
+				currData.SumQuantity += int(item.L_QUANTITY)
+				currData.SumPrice += item.L_EXTENDEDPRICE
+				currData.SumDiscount += item.L_DISCOUNT
+				currData.SumDiscPrice += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT))
+				currData.SumCharge += (item.L_EXTENDEDPRICE * (1 - item.L_DISCOUNT) * (1 + item.L_TAX))
+				currData.NItems++
 			}
 		} else {
 			continue //Too recent order, skip.
@@ -1548,11 +1558,37 @@ func (ti TableInfo) makeQ1IndexUpds(q1Map map[int8]map[string]*Q1Data, bucketI i
 	//pos := makeQ1IndexUpdsHelper(q1Map, upds, 0, bucketI)
 	//return upds[:pos]
 	upds = make([]crdt.UpdateObjectParams, 1)
-	makeQ1IndexUpdsHelper(q1Map, upds, 0, bucketI)
+	MakeQ1IndexUpdsHelper(ti.Tables.SortedReturnFlagLineStatus, q1Map, upds, 0, bucketI)
 	return upds
 }
 
-func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
+func MakeQ1IndexUpdsHelper(sortedPairKeys []string, q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
+	keyArgs := crdt.KeyParams{Key: Q1_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}
+	dayMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 61)} //60 to 120 days, inclusive (61 days)
+	var q1Data *Q1Data
+	var ok bool
+	var nItems int32
+	var doubleI, tripleI int
+	for day, dayMap := range q1Map {
+		//Ints: 4*(sum+count) = 8; Floats: 3*4 = 12; Avg: 3*4 = 12
+		ints, floats, sums, counts := make([]int64, 8), make([]float64, 12), make([]int64, 12), make([]int32, 12)
+		for i, pairKey := range sortedPairKeys {
+			q1Data, ok = dayMap[pairKey]
+			if ok {
+				nItems, doubleI, tripleI = int32(q1Data.NItems), 2*i, 3*i
+				ints[doubleI], ints[doubleI+1] = int64(q1Data.SumQuantity), int64(q1Data.NItems)
+				floats[tripleI], floats[tripleI+1], floats[tripleI+2] = q1Data.SumPrice, q1Data.SumDiscPrice, q1Data.SumCharge
+				sums[tripleI], sums[tripleI+1], sums[tripleI+2] = int64(q1Data.SumQuantity), int64(q1Data.SumPrice*100), int64(q1Data.SumDiscount*100)
+				counts[tripleI], counts[tripleI+1], counts[tripleI+2] = nItems, nItems, nItems
+			}
+		}
+		dayMapUpd.Upds[strconv.FormatInt(int64(day), 10)] = crdt.MultiArrayUpdateAll{Ints: ints, Floats: floats, Counts: counts, Sums: sums}
+	}
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: dayMapUpd}
+	return bufI + 1
+}
+
+/*func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
 	keyArgs := crdt.KeyParams{Key: Q1_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}
 	dayMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 61)} //60 to 120 days, inclusive (61 days)
 	var outerMapUpd crdt.EmbMapUpdateAll
@@ -1565,7 +1601,7 @@ func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateO
 	}
 	buf[bufI] = crdt.UpdateObjectParams{KeyParams: keyArgs, UpdateArgs: dayMapUpd}
 	return bufI + 1
-}
+}*/
 
 /*func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI int) {
 	var keyArgs crdt.KeyParams
@@ -1582,7 +1618,7 @@ func makeQ1IndexUpdsHelper(q1Map map[int8]map[string]*Q1Data, buf []crdt.UpdateO
 	return bufI
 }*/
 
-func makeQ1InnerMapUpd(q1Data *Q1Data) (mapUpd crdt.EmbMapUpdateAll) {
+/*func makeQ1InnerMapUpd(q1Data *Q1Data) (mapUpd crdt.EmbMapUpdateAll) {
 	mapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 8)} //8: Number of fields
 	mapUpd.Upds[Q1_SUM_QTY] = crdt.Increment{Change: int32(q1Data.sumQuantity)}
 	mapUpd.Upds[Q1_SUM_BASE_PRICE] = crdt.IncrementFloat{Change: q1Data.sumPrice}
@@ -1593,7 +1629,7 @@ func makeQ1InnerMapUpd(q1Data *Q1Data) (mapUpd crdt.EmbMapUpdateAll) {
 	mapUpd.Upds[Q1_AVG_DISC] = crdt.AddMultipleValue{SumValue: int64(q1Data.sumDiscount * 100), NAdds: int64(q1Data.nItems)}
 	mapUpd.Upds[Q1_COUNT_ORDER] = crdt.Increment{Change: int32(q1Data.nItems)}
 	return mapUpd
-}
+}*/
 
 func (ti TableInfo) getOrders() []*Orders {
 	orders := ti.Tables.Orders
@@ -2022,6 +2058,7 @@ func (ti TableInfo) q7CalcHelper(q7Map map[int8]map[int16]map[int8]float64, orde
 	}
 }
 
+// Year -> nat1 -> nat2
 func (ti TableInfo) makeQ7IndexUpds(q7Map map[int8]map[int16]map[int8]float64, bucketI int) (upds []crdt.UpdateObjectParams, updsDone int) {
 	//upds = make([]crdt.UpdateObjectParams, 2) //2 embMaps: 1995, 1996.
 	mapUpd95, mapUpd96 := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q7Map))}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q7Map))}
@@ -2078,12 +2115,10 @@ func (ti TableInfo) createQ8LocalMaps() (nationMap, regionMap []map[string]map[i
 				typeNatMap[int8(j)] = &Q8YearPair{sum1995: 0, sum1996: 0}
 			}
 			typeRegMap[int8(i)] = &Q8YearPair{sum1995: 0, sum1996: 0}
-			fmt.Println(typeS)
 			currNatMap[typeS], currRegionMap[typeS] = typeNatMap, typeRegMap
 		}
 		nationMap[i], regionMap[i] = currNatMap, currRegionMap
 	}
-	fmt.Println()
 	return
 }
 
@@ -2194,8 +2229,10 @@ func (ti TableInfo) prepareQ9IndexLocal() (upds [][]crdt.UpdateObjectParams, upd
 	}
 	upds = make([][]crdt.UpdateObjectParams, len(ti.Tables.Regions))
 	for i := range upds {
-		fmt.Printf("Size of region %d: %d\n", i, len(q9RegionMap[i][ti.Tables.Colors[0]]))
-		upds[i], updsDone[i] = ti.makeQ9IndexUpds(q9RegionMap[i], INDEX_BKT+i)
+		//fmt.Printf("Size of region %d: %d\n", i, len(q9RegionMap[i][ti.Tables.Colors[0]]))
+		//upds[i], updsDone[i] = ti.makeQ9IndexUpds(q9RegionMap[i], INDEX_BKT+i)
+		upds[i], updsDone[i] = ti.makeQ9IndexUpdsLocal(q9RegionMap[i], INDEX_BKT+i, i)
+		fmt.Printf("[Q9IndexLocal]Prepared update for key %v\n", upds[i][0].KeyParams)
 	}
 	return
 }
@@ -2210,14 +2247,24 @@ func (ti TableInfo) prepareQ9Index() (upds []crdt.UpdateObjectParams, updsDone i
 	//This could, on worst case scenario, mean that a new order (up to 8 lineitems) could do 40 updates. And another 40 for remove.
 	//So an add/remove cycle could lead to 80 updates!!!
 	//Better bundle the whole view in one embedded CRDT.
+	//Note: Updated this to use a map[string][]float64 instead of a map[string]map[int8]map[int16]float64, as this query had the slowest loading (9s!)
+	//The []float64 represents both nation and year (nat*len(years)+year)
+	start := time.Now().UnixNano() / 1000000
 	q9Map, orders := ti.createQ9Map(), ti.getOrders()
+	endMapCreate := time.Now().UnixNano() / 1000000
 	for i, order := range orders {
 		ti.q9CalcHelper(q9Map, ti.Tables.LineItems[i], order.O_ORDERDATE.YEAR)
 	}
-	return ti.makeQ9IndexUpds(q9Map, INDEX_BKT)
+	endMapCalc := time.Now().UnixNano() / 1000000
+	//return ti.makeQ9IndexUpds(q9Map, INDEX_BKT)
+
+	upds, updsDone = ti.makeQ9IndexUpds(q9Map, INDEX_BKT)
+	endUpds := time.Now().UnixNano() / 1000000
+	fmt.Printf("[Q9Index]Q9 total took %d ms. Map creation took %d ms. Map calc took %d ms. Upds took %d ms.\n", endUpds-start, endMapCreate-start, endMapCalc-endMapCreate, endUpds-endMapCalc)
+	return
 }
 
-func (ti TableInfo) createQ9LocalMap() (q9RegionMap []map[string]map[int8]map[int16]float64) {
+/*func (ti TableInfo) createQ9LocalMap() (q9RegionMap []map[string]map[int8]map[int16]float64) {
 	q9RegionMap = make([]map[string]map[int8]map[int16]float64, len(ti.Tables.Regions))
 	natsPerRegion := ti.Tables.NationsByRegion
 	var regMap map[string]map[int8]map[int16]float64
@@ -2234,9 +2281,9 @@ func (ti TableInfo) createQ9LocalMap() (q9RegionMap []map[string]map[int8]map[in
 		q9RegionMap[regId] = regMap
 	}
 	return
-}
+}*/
 
-func (ti TableInfo) createQ9Map() (q9Map map[string]map[int8]map[int16]float64) {
+/*func (ti TableInfo) createQ9Map() (q9Map map[string]map[int8]map[int16]float64) {
 	q9Map = make(map[string]map[int8]map[int16]float64, len(ti.Tables.Colors))
 	var colorMap map[int8]map[int16]float64
 	nations := ti.Tables.Nations
@@ -2248,9 +2295,35 @@ func (ti TableInfo) createQ9Map() (q9Map map[string]map[int8]map[int16]float64) 
 		q9Map[color] = colorMap
 	}
 	return
+}*/
+
+func (ti TableInfo) createQ9LocalMap() (q9RegionMap []map[string][]float64) {
+	q9RegionMap = make([]map[string][]float64, len(ti.Tables.Regions))
+	natsPerRegion := ti.Tables.NationsByRegion
+	var regMap map[string][]float64
+	for regId, regNats := range natsPerRegion {
+		regMap = make(map[string][]float64, len(ti.Tables.Colors))
+		for _, color := range ti.Tables.Colors {
+			regMap[color] = make([]float64, len(regNats)*len(Q9_YEARS))
+		}
+		q9RegionMap[regId] = regMap
+	}
+	return
 }
 
-func (ti TableInfo) q9LocalCalcHelper(q9RegionMap []map[string]map[int8]map[int16]float64, items []*LineItem, year int16) {
+// color -> (nat*year) (nat1year1992, nat1year1993, ...)
+func (ti TableInfo) createQ9Map() (q9Map map[string][]float64) {
+	q9Map = make(map[string][]float64, len(ti.Tables.Colors))
+	var colorMap []float64
+	nations := ti.Tables.Nations
+	for _, color := range ti.Tables.Colors {
+		colorMap = make([]float64, len(nations)*len(Q9_YEARS))
+		q9Map[color] = colorMap
+	}
+	return
+}
+
+/*func (ti TableInfo) q9LocalCalcHelper(q9RegionMap []map[string]map[int8]map[int16]float64, items []*LineItem, year int16) {
 	var natId int8
 	var colors []string
 	var partSupp *PartSupp
@@ -2258,7 +2331,8 @@ func (ti TableInfo) q9LocalCalcHelper(q9RegionMap []map[string]map[int8]map[int1
 	var regionId int8
 	for _, item := range items {
 		natId = ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
-		colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		//colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		colors = ti.Tables.ColorsOfPart[item.L_PARTKEY]
 		partSupp = ti.Tables.GetPartSuppOfLineitem(item.L_PARTKEY, item.L_SUPPKEY)
 		value = item.L_EXTENDEDPRICE*(1-item.L_DISCOUNT) - partSupp.PS_SUPPLYCOST*float64(item.L_QUANTITY)
 		regionId = ti.Tables.Nations[natId].N_REGIONKEY
@@ -2266,32 +2340,191 @@ func (ti TableInfo) q9LocalCalcHelper(q9RegionMap []map[string]map[int8]map[int1
 			q9RegionMap[regionId][color][natId][year] += value
 		}
 	}
+}*/
+
+func (ti TableInfo) q9LocalCalcHelper(q9RegionMap []map[string][]float64, items []*LineItem, year int16) {
+	var natId int8
+	var colors []string
+	var partSupp *PartSupp
+	var value float64
+	var regionId int8
+	var natPos int32
+	nYears := len(Q9_YEARS)
+	for _, item := range items {
+		natId = ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+		//colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		colors = ti.Tables.ColorsOfPart[item.L_PARTKEY]
+		partSupp = ti.Tables.GetPartSuppOfLineitem(item.L_PARTKEY, item.L_SUPPKEY)
+		value = item.L_EXTENDEDPRICE*(1-item.L_DISCOUNT) - partSupp.PS_SUPPLYCOST*float64(item.L_QUANTITY)
+		regionId = ti.Tables.Nations[natId].N_REGIONKEY
+		natPos = ti.Tables.SortedNationIdsByRegion[regionId][natId]
+		for _, color := range colors {
+			q9RegionMap[regionId][color][int(natPos)*nYears+int(year-1992)] += value
+		}
+	}
 }
 
-func (ti TableInfo) q9CalcHelper(q9Map map[string]map[int8]map[int16]float64, items []*LineItem, year int16) {
+func (ti TableInfo) q9CalcHelper(q9Map map[string][]float64, items []*LineItem, year int16) {
+	var natId int8
+	var colors []string
+	var partSupp *PartSupp
+	var value float64
+	nYears := len(Q9_YEARS)
+	for _, item := range items {
+		natId = ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+		//colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		colors = ti.Tables.ColorsOfPart[item.L_PARTKEY]
+		partSupp = ti.Tables.GetPartSuppOfLineitem(item.L_PARTKEY, item.L_SUPPKEY)
+		value = item.L_EXTENDEDPRICE*(1-item.L_DISCOUNT) - partSupp.PS_SUPPLYCOST*float64(item.L_QUANTITY)
+		for _, color := range colors {
+			q9Map[color][int(natId)*nYears+int(year-1992)] += value
+		}
+	}
+}
+
+/*func (ti TableInfo) q9CalcHelper(q9Map map[string]map[int8]map[int16]float64, items []*LineItem, year int16) {
 	var natId int8
 	var colors []string
 	var partSupp *PartSupp
 	var value float64
 	for _, item := range items {
 		natId = ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
-		colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		//colors = strings.Split(ti.Tables.Parts[item.L_PARTKEY].P_NAME, " ")
+		colors = ti.Tables.ColorsOfPart[item.L_PARTKEY]
 		partSupp = ti.Tables.GetPartSuppOfLineitem(item.L_PARTKEY, item.L_SUPPKEY)
 		value = item.L_EXTENDEDPRICE*(1-item.L_DISCOUNT) - partSupp.PS_SUPPLYCOST*float64(item.L_QUANTITY)
 		for _, color := range colors {
 			q9Map[color][natId][year] += value
 		}
 	}
+}*/
+
+func (ti TableInfo) makeQ9IndexUpdsLocal(q9LocalMap map[string][]float64, bucketI int, reg int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	outerMapUpd := crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(q9LocalMap))}
+	var natYearUpd crdt.MultiArrayIncFloat
+	//sortedNatsLocalIds := ti.Tables.SortedNationIdsByRegion[reg]
+	//natYearPairs, nYears := len(sortedNatsLocalIds)*len(Q9_YEARS), len(Q9_YEARS)
+	nRegNations, nYears := len(ti.Tables.SortedNationIdsByRegion[reg]), len(Q9_YEARS)
+	natYearPairs := nRegNations * nYears
+	k := 0
+	for color, colorMap := range q9LocalMap {
+		natYearUpd = make(crdt.MultiArrayIncFloat, natYearPairs)
+		for j := 0; j < nRegNations; j++ {
+			//for natId, natPos := range sortedNatsLocalIds { //For the query, we want sorted by nation
+			//fmt.Print("[MakeQ9IndexUpdsLocal](natId, natPos, finalPos:) ")
+			for i := range Q9_YEARS { //nYears-i: we want descending order later for the query
+				//natYearUpd[nYears*int(natPos)+(nYears-(i+1))] = colorMap[int(natId)*nYears+i]
+				natYearUpd[nYears*j+(nYears-(i+1))] = colorMap[j*nYears+i]
+				nUpds++
+				//fmt.Printf("(%d, %d, %d), ", natId, natPos, nYears*int(natPos)+(nYears-(i+1)))
+			}
+			//fmt.Println()
+		}
+		//fmt.Printf("[MakeQ9IndexUpdsHelper]Color: %s. natYearUpd: %v\n", color, natYearUpd)
+		outerMapUpd.Upds[k] = crdt.EmbMapUpdate{Key: color, Upd: natYearUpd}
+		k++
+	}
+	//fmt.Printf("[MakeQ9IndexUpdsHelper]Key, CrdtType, Bucket: %s, %d, %s\n", Q9_KEY, proto.CRDTType_RRMAP, Buckets[bucketI])
+	return []crdt.UpdateObjectParams{{KeyParams: crdt.KeyParams{Key: Q9_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}}, nUpds
 }
 
-func (ti TableInfo) makeQ9IndexUpds(q9Map map[string]map[int8]map[int16]float64, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+/*func (ti TableInfo) makeQ9IndexUpdsLocal(q9LocalMap map[string]map[int8]map[int16]float64, bucketI int, reg int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	outerMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q9LocalMap))}
+	var natYearUpd crdt.MultiArrayIncFloat
+	sortedNatsLocalIds := ti.Tables.SortedNationIdsByRegion[reg]
+	natYearPairs, nYears := len(sortedNatsLocalIds)*len(Q9_YEARS), len(Q9_YEARS)
+	for color, colorMap := range q9LocalMap {
+		natYearUpd = make(crdt.MultiArrayIncFloat, natYearPairs)
+		for natId, natPos := range sortedNatsLocalIds { //For the query, we want sorted by nation
+			//fmt.Print("[MakeQ9IndexUpdsLocal](natId, natPos, finalPos:) ")
+			for i := range Q9_YEARS { //nYears-i: we want descending order later for the query
+				natYearUpd[nYears*int(natPos)+(nYears-(i+1))] = colorMap[natId][int16(i+1992)]
+				nUpds++
+				//fmt.Printf("(%d, %d, %d), ", natId, natPos, nYears*int(natPos)+(nYears-(i+1)))
+			}
+			//fmt.Println()
+		}
+		//fmt.Printf("[MakeQ9IndexUpdsHelper]Color: %s. natYearUpd: %v\n", color, natYearUpd)
+		outerMapUpd.Upds[color] = natYearUpd
+	}
+	//fmt.Printf("[MakeQ9IndexUpdsHelper]Key, CrdtType, Bucket: %s, %d, %s\n", Q9_KEY, proto.CRDTType_RRMAP, Buckets[bucketI])
+	return []crdt.UpdateObjectParams{{KeyParams: crdt.KeyParams{Key: Q9_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}}, nUpds
+}*/
+
+/*func (ti TableInfo) makeQ9IndexUpds(q9Map map[string]map[int8]map[int16]float64, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	//upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Colors))
+	upds = make([]crdt.UpdateObjectParams, 1)
+	_, nUpds = makeQ9IndexUpdsHelper(ti.Tables, q9Map, upds, 0, bucketI)
+	return
+}*/
+
+func (ti TableInfo) makeQ9IndexUpds(q9Map map[string][]float64, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
 	//upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Colors))
 	upds = make([]crdt.UpdateObjectParams, 1)
 	_, nUpds = makeQ9IndexUpdsHelper(ti.Tables, q9Map, upds, 0, bucketI)
 	return
 }
 
-func makeQ9IndexUpdsHelper(tables *Tables, q9Map map[string]map[int8]map[int16]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+func makeQ9IndexUpdsHelper(tables *Tables, q9Map map[string][]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+	outerMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q9Map))}
+	var natYearUpd crdt.MultiArrayIncFloat
+	natYearPairs, nYears := len(tables.Nations)*len(Q9_YEARS), len(Q9_YEARS)
+	sortedNatsIds := tables.SortedNationsIds
+	for color, colorMap := range q9Map {
+		natYearUpd = make(crdt.MultiArrayIncFloat, natYearPairs)
+		for natId, natPos := range sortedNatsIds { //For the query, we want sorted by nation
+			for i := range Q9_YEARS { //nYears-i: we want descending order later for the query
+				natYearUpd[nYears*int(natPos)+(nYears-(i+1))] = colorMap[int(natId)*nYears+i]
+				nUpds++
+			}
+		}
+		//fmt.Printf("[MakeQ9IndexUpdsHelper]Color: %s. natYearUpd: %v\n", color, natYearUpd)
+		outerMapUpd.Upds[color] = natYearUpd
+	}
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q9_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}
+	bufI++
+	return bufI, nUpds
+}
+
+// Note: This should not be used by queryInfos, as otherwise it is inefficient (many empty array positions)
+/*func makeQ9IndexUpdsHelper(tables *Tables, q9Map map[string]map[int8]map[int16]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+tsStart := time.Now().UnixNano()
+outerMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q9Map))}
+var natYearUpd crdt.MultiArrayIncFloat
+natYearPairs, nYears := len(tables.Nations)*len(Q9_YEARS), len(Q9_YEARS)
+sortedNatsIds := tables.SortedNationsIds
+for color, colorMap := range q9Map {
+	natYearUpd = make(crdt.MultiArrayIncFloat, natYearPairs)
+	for natId, natPos := range sortedNatsIds { //For the query, we want sorted by nation
+		for i := range Q9_YEARS { //nYears-i: we want descending order later for the query
+			natYearUpd[nYears*int(natPos)+(nYears-(i+1))] = colorMap[natId][int16(i+1992)]
+			nUpds++
+		}
+	}
+	//fmt.Printf("[MakeQ9IndexUpdsHelper]Color: %s. natYearUpd: %v\n", color, natYearUpd)
+	outerMapUpd.Upds[color] = natYearUpd
+}
+/*for _, colorMap := range q9Map {
+	fmt.Print("Keys in colorMap: ")
+	for natId := range colorMap {
+		fmt.Print(natId, ", ")
+	}
+	fmt.Println()
+	break
+}
+fmt.Print("Keys in sortedNatsIds: ")
+for natId, natPos := range sortedNatsIds {
+	fmt.Printf("%d(%d), ", natId, natPos)
+}
+fmt.Println()*/ /*
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q9_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}
+	bufI++
+	tsEnd := time.Now().UnixNano()
+	fmt.Printf("[MakeQ9IndexUpdsHelper]Time taken to build upds (UpdateObjectParams): %d(ms)\n", (tsEnd-tsStart)/int64(time.Millisecond))
+	return bufI, nUpds
+}*/
+
+/*func makeQ9IndexUpdsHelper(tables *Tables, q9Map map[string]map[int8]map[int16]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
 	//var keyParams crdt.KeyParams
 	var mapNationUpd, mapYearUpd crdt.EmbMapUpdateAll
 	outerMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q9Map))}
@@ -2316,7 +2549,7 @@ func makeQ9IndexUpdsHelper(tables *Tables, q9Map map[string]map[int8]map[int16]f
 	//fmt.Printf("[ClientIndex][Q9][MakeUpds]UpdObjParams: %+v\n", buf[bufI-1])
 	//fmt.Printf("[ClientIndex][Q9][MakeUpds]UpdArgs: %+v\n", *buf[bufI-1].UpdateArgs)
 	return bufI, nUpds
-}
+}*/
 
 func (ti TableInfo) prepareQ10IndexLocal() (upds [][]crdt.UpdateObjectParams, updsDone []int) {
 	//reg->quarter->custID->sum
@@ -2401,7 +2634,7 @@ func (ti TableInfo) makeQ10IndexUpds(q10Info []map[int32]float64, bucketI, nUpds
 	j := 0
 	for i, custMap := range q10Info {
 		keyParams = crdt.KeyParams{Key: Q10_KEY + strconv.FormatInt(int64(i), 10), CrdtType: proto.CRDTType_TOPSUM, Bucket: Buckets[bucketI]}
-		upds[i*2] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: crdt.TopKInit{TopSize: 20}}
+		upds[i*2] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: crdt.TopSInit(20)}
 		if iCfg.UseTopKAll {
 			currTopUpd := crdt.TopSAddAll{Scores: make([]crdt.TopKScore, len(custMap))}
 			j = 0
@@ -2412,7 +2645,7 @@ func (ti TableInfo) makeQ10IndexUpds(q10Info []map[int32]float64, bucketI, nUpds
 			upds[i*2+1] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: currTopUpd}
 		} else {
 			for custId, value := range custMap {
-				upds[j] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: crdt.TopSAdd{TopKScore: crdt.TopKScore{Id: custId, Score: int32(value), Data: ti.packQ10IndexExtraDataFromKey(custId)}}}
+				upds[j] = crdt.UpdateObjectParams{KeyParams: keyParams, UpdateArgs: crdt.TopSAdd{TopKScore: crdt.TopKScore{Id: custId, Score: int32(-value), Data: ti.packQ10IndexExtraDataFromKey(custId)}}}
 				j++
 			}
 		}
@@ -2435,7 +2668,7 @@ func packQ10IndexExtraData(cust *Customer, nationName string) (data *[]byte) {
 	build.WriteRune('_')*/
 	build.WriteString(cust.C_NAME)
 	build.WriteRune('_')
-	build.WriteString(cust.C_ACCTBAL)
+	build.WriteString(strconv.FormatFloat(cust.C_ACCTBAL, 'f', 2, 64))
 	build.WriteRune('_')
 	build.WriteString(cust.C_PHONE)
 	build.WriteRune('_')
@@ -2538,12 +2771,12 @@ func (ti TableInfo) prepareQ13IndexLocal() (upds [][]crdt.UpdateObjectParams, up
 	for i := range q13RegionInfo {
 		q13RegionInfo[i] = ti.createQ13Map()
 	}
-	ti.preloadQ13RegionMap()
+	//ti.preloadQ13RegionMap()
 	for _, order := range orders {
 		ti.q13CalcHelper(q13RegionInfo[ti.Custkey32ToRegionkey(order.O_CUSTKEY)], order)
 	}
-	for _, info := range q13RegionInfo {
-		ti.q13FromCustToNOrders(&info)
+	for i, info := range q13RegionInfo {
+		ti.q13FromCustToNOrdersLocal(&info, int8(i))
 	}
 	upds = make([][]crdt.UpdateObjectParams, len(q13RegionInfo))
 	for i := range upds {
@@ -2558,7 +2791,7 @@ func (ti TableInfo) prepareQ13IndexLocal() (upds [][]crdt.UpdateObjectParams, up
 func (ti TableInfo) prepareQ13Index() (upds []crdt.UpdateObjectParams, updsDone int) {
 	q13Info = ti.createQ13Map()
 	orders := ti.getOrders()
-	ti.preloadQ13Map()
+	//ti.preloadQ13Map()		//No longer needed as now we use arrays of customers which are already initialized to 0.
 	for _, order := range orders {
 		ti.q13CalcHelper(q13Info, order)
 	}
@@ -2569,14 +2802,14 @@ func (ti TableInfo) prepareQ13Index() (upds []crdt.UpdateObjectParams, updsDone 
 }
 
 func (ti TableInfo) createQ13Map() (info Q13Info) {
-	info = Q13Info{wordsToCustNOrders: make(map[string]map[int32]int8, len(Q13_BOTH_WORDS)), custToNOrders: make(map[int32]int8, len(ti.Tables.Customers)), wordsToNOrders: make(map[string]map[int8]int32, len(Q13_BOTH_WORDS))}
+	info = Q13Info{wordsToCustNOrders: make(map[string][]int8, len(Q13_BOTH_WORDS)), custToNOrders: make([]int8, len(ti.Tables.Customers)), wordsToNOrders: make(map[string]map[int8]int32, len(Q13_BOTH_WORDS))}
 	for _, fullWord := range Q13_BOTH_WORDS {
-		info.wordsToCustNOrders[fullWord], info.wordsToNOrders[fullWord] = make(map[int32]int8, len(ti.Tables.Customers)), make(map[int8]int32, 30) //TODO: Better heuristic for nOrders -> count?
+		info.wordsToCustNOrders[fullWord], info.wordsToNOrders[fullWord] = make([]int8, len(ti.Tables.Customers)), make(map[int8]int32, 30) //TODO: Better heuristic for nOrders -> count?
 	}
 	return
 }
 
-func (ti TableInfo) preloadQ13Map() {
+/*func (ti TableInfo) preloadQ13Map() {
 	// Preload with 0 on all customers as many customers (1/3) will not have any order
 	for _, fullWord := range Q13_BOTH_WORDS {
 		wordEntry := q13Info.wordsToCustNOrders[fullWord]
@@ -2587,9 +2820,9 @@ func (ti TableInfo) preloadQ13Map() {
 	for _, cust := range ti.Tables.Customers[1:] {
 		q13Info.custToNOrders[cust.C_CUSTKEY] = 0
 	}
-}
+}*/
 
-func (ti TableInfo) preloadQ13RegionMap() {
+/*func (ti TableInfo) preloadQ13RegionMap() {
 	// Preload with 0 on all customers as many customers (1/3) will not have any order
 	for _, fullWord := range Q13_BOTH_WORDS {
 		wordEntries := []map[int32]int8{q13RegionInfo[0].wordsToCustNOrders[fullWord], q13RegionInfo[1].wordsToCustNOrders[fullWord],
@@ -2602,7 +2835,7 @@ func (ti TableInfo) preloadQ13RegionMap() {
 	for _, cust := range ti.Tables.Customers[1:] {
 		custEntries[ti.Tables.Nations[cust.C_NATIONKEY].N_REGIONKEY][cust.C_CUSTKEY] = 0
 	}
-}
+}*/
 
 func (ti TableInfo) q13CalcHelper(info Q13Info, order *Orders) {
 	info.custToNOrders[order.O_CUSTKEY]++
@@ -2635,9 +2868,50 @@ func (ti TableInfo) q13FromCustToNOrders(info *Q13Info) {
 	}
 }
 
+// Ignores positions not corresponding to local customers
+func (ti TableInfo) q13FromCustToNOrdersLocal(info *Q13Info, reg int8) {
+	var nO int8
+	for custID := 1; custID < len(info.custToNOrders); custID++ {
+		nO = info.custToNOrders[custID]
+		if ti.Tables.Nations[ti.Tables.Customers[custID].C_NATIONKEY].N_REGIONKEY == reg {
+			for words, custMap := range info.wordsToCustNOrders {
+				info.wordsToNOrders[words][nO-custMap[custID]]++
+			}
+		}
+	}
+}
+
 // CRDT: [Word1+Word2] -> [nOrders]->nCustomers
 // Keep it all under one CRDT as each update will need to update all words entries (except potencially one)
 func (ti TableInfo) makeQ13IndexUpds(info Q13Info, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	highestNOrders := int8(-1)
+	for _, wordToNOrders := range info.wordsToNOrders {
+		for nO := range wordToNOrders {
+			if nO > highestNOrders {
+				highestNOrders = nO
+			}
+		}
+	}
+
+	outerMapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(info.wordsToNOrders))} //Words -> Map
+	var counterArrayUpd crdt.CounterArrayIncrementMulti
+	highestOrder := int8(0)
+	for words, nOrdersMap := range info.wordsToNOrders {
+		counterArrayUpd = make(crdt.CounterArrayIncrementMulti, highestNOrders+1)
+		for nOrders, nCount := range nOrdersMap {
+			counterArrayUpd[nOrders] = int64(nCount)
+			nUpds++
+			if nOrders > highestOrder {
+				highestOrder = nOrders
+			}
+		}
+		outerMapUpd.Upds[words] = counterArrayUpd[:highestOrder]
+		highestOrder = 0
+	}
+	return []crdt.UpdateObjectParams{{KeyParams: crdt.KeyParams{Key: Q13_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}}, nUpds
+}
+
+/*func (ti TableInfo) makeQ13IndexUpds(info Q13Info, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
 	highestNOrders := int8(-1)
 	for _, wordToNOrders := range info.wordsToNOrders {
 		for nO := range wordToNOrders {
@@ -2664,7 +2938,7 @@ func (ti TableInfo) makeQ13IndexUpds(info Q13Info, bucketI int) (upds []crdt.Upd
 	}
 	upds = []crdt.UpdateObjectParams{{KeyParams: crdt.KeyParams{Key: Q13_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerMapUpd}}
 	return
-}
+}*/
 
 /*
 func (ti TableInfo) prepareQ13IndexLocal() (upds [][]crdt.UpdateObjectParams, updsDone []int) {
@@ -2807,7 +3081,9 @@ func (ti TableInfo) prepareQ16IndexLocal() (upds [][]crdt.UpdateObjectParams, up
 	}
 	upds = make([][]crdt.UpdateObjectParams, len(regQ16Info))
 	for i, info := range regQ16Info {
-		upds[i], updsDone[i] = ti.makeQ16IndexUpds(info, INDEX_BKT+i)
+		//upds[i], updsDone[i] = ti.makeQ16IndexUpds(info, INDEX_BKT+i)
+		//upds[i], updsDone[i] = ti.makeQ16IndexUpdsNewCArray(info, INDEX_BKT+i)
+		upds[i], updsDone[i] = ti.makeQ16IndexUpdsNewerCArray(info, INDEX_BKT+i)
 	}
 	return
 }
@@ -2827,7 +3103,10 @@ func (ti TableInfo) prepareQ16Index() (upds []crdt.UpdateObjectParams, updsDone 
 	for _, ps := range ti.Tables.PartSupps {
 		ti.q16CalcHelper(q16Info, ps)
 	}
-	return ti.makeQ16IndexUpds(q16Info, INDEX_BKT)
+	//return ti.makeQ16IndexUpds(q16Info, INDEX_BKT)
+	//return ti.makeQ16IndexUpdsNew(q16Info, INDEX_BKT)
+	//return ti.makeQ16IndexUpdsNewCArray(q16Info, INDEX_BKT)
+	return ti.makeQ16IndexUpdsNewerCArray(q16Info, INDEX_BKT)
 }
 
 func (ti TableInfo) createQ16Map() (info Q16Info) {
@@ -2868,6 +3147,103 @@ func (ti TableInfo) q16CalcHelper(q16Info Q16Info, ps *PartSupp) {
 	if _, has := q16Info.complainSupps[ps.PS_SUPPKEY]; !has {
 		part := ti.Tables.Parts[ps.PS_PARTKEY]
 		q16Info.suppsPerCategory[part.P_SIZE][part.P_BRAND][ti.Tables.TypesToMediumType[part.P_TYPE]][ps.PS_SUPPKEY] = struct{}{}
+	}
+	return
+}
+
+func (ti TableInfo) makeBrandToPosString() (brandToPos map[string]string) {
+	brandToPos = make(map[string]string, len(ti.Tables.Brands))
+	for i, brand := range ti.Tables.Brands {
+		brandToPos[brand] = strconv.FormatInt(int64(i), 10)
+	}
+	return
+}
+
+func (ti TableInfo) makeMediumTypeToPosString() (typeToPos map[string]string) {
+	typeToPos = make(map[string]string, len(ti.Tables.MediumType))
+	for i, typeS := range ti.Tables.MediumType {
+		typeToPos[typeS] = strconv.FormatInt(int64(i), 10)
+	}
+	return
+}
+
+func (ti TableInfo) makeMediumTypeToPos() (typeToPos map[string]int) {
+	typeToPos = make(map[string]int, len(ti.Tables.MediumType))
+	for i, typeS := range ti.Tables.MediumType {
+		typeToPos[typeS] = i
+	}
+	return
+}
+
+func (ti TableInfo) makeQ16IndexUpdsNewerCArray(q16Info Q16Info, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, 50) //50 sizes, 1 CRDT per size.
+	brandToPos, typeToPos := ti.makeBrandToPosString(), ti.makeMediumTypeToPos()
+	nBrands, nTypes := len(brandToPos), len(typeToPos)
+	var sizeArray crdt.CounterArrayIncrementMulti
+	var brandMap map[string]map[int32]struct{}
+	var typeMap map[int32]struct{}
+	updsI := 0
+	for size, sizeMap := range q16Info.suppsPerCategory {
+		sizeArray = make(crdt.CounterArrayIncrementMulti, nBrands*nTypes)
+		for i, brand := range ti.Tables.Brands {
+			brandMap = sizeMap[brand]
+			for j, typeValue := range ti.Tables.MediumType {
+				typeMap = brandMap[typeValue]
+				sizeArray[i*nTypes+j] = int64(len(typeMap))
+				nUpds++
+			}
+		}
+		upds[updsI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q16_KEY + size, CrdtType: proto.CRDTType_ARRAY_COUNTER, Bucket: Buckets[bucketI]}, UpdateArgs: sizeArray}
+		updsI++
+	}
+	fmt.Println("[Q16]Making Q16 Index Upds: NewerCArray. updsI:", updsI)
+	return
+}
+
+func (ti TableInfo) makeQ16IndexUpdsNewCArray(q16Info Q16Info, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, 50) //50 sizes, 1 CRDT per size.
+	brandToPos, typeToPos := ti.makeBrandToPosString(), ti.makeMediumTypeToPos()
+	var sizeMapUpd crdt.EmbMapUpdateAll
+	var brandMapUpd crdt.CounterArrayIncrementMulti
+	i := 0
+	for size, sizeMap := range q16Info.suppsPerCategory {
+		sizeMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(sizeMap))}
+		for brand, brandMap := range sizeMap {
+			brandMapUpd = make(crdt.CounterArrayIncrementMulti, len(brandMap))
+			for typeValue, typeMap := range brandMap {
+				brandMapUpd[typeToPos[typeValue]] = int64(len(typeMap))
+				nUpds++
+			}
+			sizeMapUpd.Upds[brandToPos[brand]] = brandMapUpd
+		}
+		upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q16_KEY + size, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: sizeMapUpd}
+		i++
+	}
+	return
+}
+
+// Map[Brand]->Array[Type]->Counter
+func (ti TableInfo) makeQ16IndexUpdsNew(q16Info Q16Info, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, 50) //50 sizes, 1 CRDT per size.
+	brandToPos, typeToPos := ti.makeBrandToPosString(), ti.makeMediumTypeToPosString()
+	var sizeMapUpd, brandMapUpd crdt.EmbMapUpdateAll
+	i := 0
+	for size, sizeMap := range q16Info.suppsPerCategory {
+		sizeMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(sizeMap))}
+		for brand, brandMap := range sizeMap {
+			brandMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(brandMap))}
+			for typeValue, typeMap := range brandMap {
+				//brandMapUpd.Upds[typeValue] = crdt.Increment{Change: int32(len(typeMap))}
+				brandMapUpd.Upds[typeToPos[typeValue]] = crdt.Increment{Change: int32(len(typeMap))}
+				nUpds++
+			}
+			//sizeMapUpd.Upds[brand] = brandMapUpd
+			sizeMapUpd.Upds[brandToPos[brand]] = brandMapUpd
+			//fmt.Printf("[INDEX]Q16New. Brand: %s. Upd: %v\n", brandToPos[brand], brandMapUpd)
+		}
+		//fmt.Printf("[INDEX]Q16New. Updating CRDT key. %s\n", Q16_KEY+size)
+		upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q16_KEY + size, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: sizeMapUpd}
+		i++
 	}
 	return
 }
@@ -3360,7 +3736,7 @@ func isLineItemEligibleForQ19(tables *Tables, item *LineItem) (eligible bool, co
 	if containerType == 'S' {
 		subContainer := part.P_CONTAINER[3:]
 		if subContainer[0] == 'P' || subContainer == "CASE" || strings.HasPrefix(subContainer, "BO") {
-			if len(part.P_SIZE) == 1 || part.P_SIZE[0] <= '5' {
+			if len(part.P_SIZE) == 1 && part.P_SIZE[0] <= '5' {
 				if item.L_QUANTITY >= 1 && item.L_QUANTITY <= 20 {
 					return true, containerS, brand
 				}
@@ -3395,7 +3771,7 @@ func (ti TableInfo) makeQ19IndexUpds(q19Info map[string]map[string]map[int8]floa
 	return
 }
 
-func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+/*func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
 	outerUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 3)} //3 container types
 	for container, containerMap := range q19Info {
 		mapUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(containerMap)*21)}
@@ -3410,7 +3786,32 @@ func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf 
 		outerUpd.Upds[container] = mapUpd
 	}
 	buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerUpd}
-	return bufI, nUpds
+	return bufI + 1, nUpds
+}*/
+
+// Note: QueryInfos should call its own.
+func makeQ19IndexUpdsHelper(q19Info map[string]map[string]map[int8]float64, buf []crdt.UpdateObjectParams, bufI, bucketI int) (newBufI, nUpds int) {
+	outerUpd := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 3)} //3 container types
+	var mapUpd crdt.EmbMapUpdateAll
+	var quantityUpd crdt.MultiArrayIncFloat
+	sortedContainers, quantityOffset, quantitySize := []string{"S", "M", "L"}, []int8{1, 10, 20}, []int{20, 21, 21} //This helps ensure we know the quantity range at each time
+	currOffset, currSize := int8(0), 0
+	for i, container := range sortedContainers {
+		containerMap := q19Info[container]
+		mapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(containerMap))}
+		currOffset, currSize = quantityOffset[i], quantitySize[i]
+		for brand, quantityMap := range containerMap {
+			quantityUpd = make(crdt.MultiArrayIncFloat, currSize)
+			for quantity, value := range quantityMap {
+				quantityUpd[quantity-currOffset] = value
+				nUpds++
+			}
+			mapUpd.Upds[brand] = quantityUpd
+		}
+		outerUpd.Upds[container] = mapUpd
+	}
+	buf[bufI] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q19_KEY, CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: outerUpd}
+	return bufI + 1, nUpds
 }
 
 /*
@@ -3458,7 +3859,8 @@ func (ti TableInfo) prepareQ20IndexLocal() (upds [][]crdt.UpdateObjectParams, up
 
 	upds = make([][]crdt.UpdateObjectParams, len(q20RegMap))
 	for i, natMap := range q20RegMap {
-		upds[i], updsDone[i] = ti.makeQ20IndexUpds(natMap, INDEX_BKT+i)
+		//upds[i], updsDone[i] = ti.makeQ20IndexUpds(natMap, INDEX_BKT+i)
+		upds[i], updsDone[i] = ti.makeQ20IndexUpdsNew(natMap, INDEX_BKT+i)
 	}
 	return
 }
@@ -3477,7 +3879,67 @@ func (ti TableInfo) prepareQ20Index() (upds []crdt.UpdateObjectParams, updsDone 
 		ti.q20CalcHelper(q20Map, items)
 	}
 	//ti.printQ20(q20Map)
-	return ti.makeQ20IndexUpds(q20Map, INDEX_BKT)
+	//return ti.makeQ20IndexUpds(q20Map, INDEX_BKT)
+	return ti.makeQ20IndexUpdsNew(q20Map, INDEX_BKT)
+}
+
+func (ti TableInfo) prepareQ20IndexLocalTopSum() (upds [][]crdt.UpdateObjectParams, updsDone []int) {
+	start := time.Now().UnixNano() / 1000000
+	q20Map, updsDone := ti.createQ20MapTopSum(), make([]int, len(ti.Tables.Regions))
+	finishMap := time.Now().UnixNano() / 1000000
+	for _, items := range ti.Tables.LineItems {
+		ti.q20CalcHelperTopSum(q20Map, items)
+	}
+	finishCalc := time.Now().UnixNano() / 1000000
+
+	//Local query (nation).
+	//Organize it by regions. Then make the protobufs in parallel to be faster.
+	//[region]->[nation+year]->Map[color]->Map[Pair[partkey+supplierkey]]->sum
+	q20RegMap := make([][][]map[string]map[PairInt]int32, len(ti.Tables.Regions))
+	for regId, nations := range ti.Tables.NationsByRegion {
+		natMap := make([][]map[string]map[PairInt]int32, len(nations))
+		for i, natId := range nations {
+			natMap[i] = q20Map[natId]
+		}
+		q20RegMap[regId] = natMap
+	}
+	finishReshard := time.Now().UnixNano() / 1000000
+
+	upds = make([][]crdt.UpdateObjectParams, len(q20RegMap))
+	replyChans := make([]chan PairUpdsNUpds, len(q20RegMap)) //We want to add the updates by order of region
+	for i, natMap := range q20RegMap {
+		replyChans[i] = make(chan PairUpdsNUpds, 1)
+		go ti.makeQ20IndexUpdsLocalTopSumRoutine(natMap, int8(i), INDEX_BKT+i, replyChans[i])
+	}
+	for i, replyChan := range replyChans {
+		reply := <-replyChan
+		upds[i], updsDone[i] = reply.upds, reply.nUpds
+	}
+	finishUpds := time.Now().UnixNano() / 1000000
+	fmt.Printf("[INDEX][Q20]Finished preparing local Q20 upds. Map creation: %dms, calculation: %dms, region split: %dms, upds: %dms, total: %dms\n", finishMap-start, finishCalc-finishMap, finishReshard-finishCalc, finishUpds-finishReshard, finishUpds-start)
+	return
+}
+
+func (ti TableInfo) prepareQ20IndexTopSum() (upds []crdt.UpdateObjectParams, updsDone int) {
+	//Counter-intuitively, we use a TopSum for the innermost level, to circumvent the overhead of reading a map
+	//(TopK and TopSum keep a slice cache until an update changes the order. Also, avoid the overhead of embedded CRDTs.)
+	//Despite implying more data duplication, we filter by year in order to reduce the size of each TopSum, as each TopSum will be downloaded fully.
+	//This TopSum uses a special key (partSupKey) for its entries: partKey*4 + supplierKey / (len(ti.Tables.Suppliers)/4).
+	//This way we can uniquely identified a PartSupp, following the TPC-H specification.
+	//Map[nation]->Map[year]->Map[color]->TopSum(partSupKey, sum(quantity), []byte(supplierId, supplierName, supplierAddress))
+	start := time.Now().UnixNano() / 1000000
+
+	q20Map := ti.createQ20MapTopSum()
+	finishMap := time.Now().UnixNano() / 1000000
+	for _, items := range ti.Tables.LineItems {
+		ti.q20CalcHelperTopSum(q20Map, items)
+	}
+	finishCalc := time.Now().UnixNano() / 1000000
+	upds, updsDone = ti.makeQ20IndexUpdsTopSum(q20Map, INDEX_BKT)
+	finishUpds := time.Now().UnixNano() / 1000000
+
+	fmt.Printf("[INDEX][Q20]Finished preparing Q20 upds. Map creation: %dms, calculation: %dms, upds: %dms, tota: %dms\n", finishMap-start, finishCalc-finishMap, finishUpds-finishCalc, finishUpds-start)
+	return
 }
 
 /*func (ti TableInfo) printQ20(q20Map map[int8]map[string]map[PairInt]map[int16]int32) {
@@ -3497,6 +3959,71 @@ for natID, natMap := range q20Map {
 	fmt.Println("[INDEX][Q20]End of PrintQ20")
 }*/
 
+func (ti TableInfo) createQ20MapTopSum() (q20Map [][]map[string]map[PairInt]int32) {
+	//nation->year->color->(partkey, supplierkey)->sum
+	q20Map = make([][]map[string]map[PairInt]int32, len(ti.Tables.Nations))
+	var nationMap []map[string]map[PairInt]int32
+	var yearMap map[string]map[PairInt]int32
+	nYears := 5
+	for nationID := range ti.Tables.Nations {
+		nationMap = make([]map[string]map[PairInt]int32, nYears)
+		for i := 0; i < nYears; i++ {
+			yearMap = make(map[string]map[PairInt]int32, len(ti.Tables.Colors))
+			for _, color := range ti.Tables.Colors {
+				yearMap[color] = make(map[PairInt]int32, len(ti.Tables.PartSupps)/(4*len(ti.Tables.Nations)*len(ti.Tables.Colors))) //*1/4: Most pairs will only have 2-3 years.
+			}
+			nationMap[i] = yearMap
+		}
+		q20Map[nationID] = nationMap
+	}
+	//Go through PartSupps to create the PairInts
+	var nationKey int8
+	var color string
+	for _, ps := range ti.Tables.PartSupps {
+		nationKey = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY)
+		color = ti.Tables.ColorsOfPart[ps.PS_PARTKEY][0]
+		for i := 0; i < nYears; i++ {
+			q20Map[nationKey][i][color][PairInt{first: ps.PS_PARTKEY, second: ps.PS_SUPPKEY}] = 0
+		}
+	}
+	return
+}
+
+/*func (ti TableInfo) createQ20MapTopSum() (q20Map map[int8]map[int16]map[string]map[PairInt]int32) {
+	//nation->year->color->(partkey, supplierkey)->sum
+	q20Map = make(map[int8]map[int16]map[string]map[PairInt]int32, len(ti.Tables.Nations))
+	var nationMap map[int16]map[string]map[PairInt]int32
+	var yearMap map[string]map[PairInt]int32
+	years := []int16{1993, 1994, 1995, 1996, 1997}
+	for nationID := range ti.Tables.Nations {
+		nationMap = make(map[int16]map[string]map[PairInt]int32, len(years))
+		for _, year := range years {
+			yearMap = make(map[string]map[PairInt]int32, len(ti.Tables.Colors))
+			for _, color := range ti.Tables.Colors {
+				yearMap[color] = make(map[PairInt]int32, len(ti.Tables.PartSupps)/(4*len(ti.Tables.Nations)*len(ti.Tables.Colors))) //*1/4: Most pairs will only have 2-3 years.
+			}
+			nationMap[year] = yearMap
+		}
+		q20Map[int8(nationID)] = nationMap
+	}
+	//Go through PartSupps to create the PairInts
+	var nationKey int8
+	//var part *Part
+	//var spaceIndex int
+	var color string
+	for _, ps := range ti.Tables.PartSupps {
+		//nationKey, part = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY), ti.Tables.Parts[ps.PS_PARTKEY]
+		nationKey = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY)
+		//spaceIndex = strings.Index(part.P_NAME, " ") //We only want the first color
+		//color = part.P_NAME[:spaceIndex]
+		color = ti.Tables.ColorsOfPart[ps.PS_PARTKEY][0]
+		for _, year := range years {
+			q20Map[nationKey][year][color][PairInt{first: ps.PS_PARTKEY, second: ps.PS_SUPPKEY}] = 0
+		}
+	}
+	return
+}*/
+
 func (ti TableInfo) createQ20Map() (q20Map map[int8]map[string]map[PairInt]map[int16]int32) {
 	//nation->color->(partkey, supplierkey)->year->sum
 	q20Map = make(map[int8]map[string]map[PairInt]map[int16]int32, len(ti.Tables.Nations))
@@ -3505,23 +4032,53 @@ func (ti TableInfo) createQ20Map() (q20Map map[int8]map[string]map[PairInt]map[i
 		nationMap = make(map[string]map[PairInt]map[int16]int32, len(ti.Tables.Colors))
 		for _, color := range ti.Tables.Colors {
 			//nationMap[color] = map[PairInt]map[int16]int32{1993: make(map[PairInt]int32), 1994: make(map[PairInt]int32), 1995: make(map[PairInt]int32), 1996: make(map[PairInt]int32), 1997: make(map[PairInt]int32)}
-			nationMap[color] = make(map[PairInt]map[int16]int32, len(ti.PartSupps)/(len(ti.Tables.Nations)*len(ti.Tables.Colors)))
+			nationMap[color] = make(map[PairInt]map[int16]int32, len(ti.Tables.PartSupps)/(len(ti.Tables.Nations)*len(ti.Tables.Colors)))
 		}
 		q20Map[int8(nationID)] = nationMap
 	}
 	//Go through PartSupps to create the PairInts
 	var nationKey int8
-	var part *Part
-	var spaceIndex int
+	//var part *Part
+	//var spaceIndex int
 	var color string
 	for _, ps := range ti.Tables.PartSupps {
-		nationKey, part = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY), ti.Tables.Parts[ps.PS_PARTKEY]
-		spaceIndex = strings.Index(part.P_NAME, " ") //We only want the first color
-		color = part.P_NAME[:spaceIndex]
+		//nationKey, part = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY), ti.Tables.Parts[ps.PS_PARTKEY]
+		nationKey = ti.SupplierkeyToNationkey(ps.PS_SUPPKEY)
+		/*spaceIndex = strings.Index(part.P_NAME, " ") //We only want the first color
+		color = part.P_NAME[:spaceIndex]*/
+		color = ti.Tables.ColorsOfPart[ps.PS_PARTKEY][0]
 		q20Map[nationKey][color][PairInt{first: ps.PS_PARTKEY, second: ps.PS_SUPPKEY}] = make(map[int16]int32)
 	}
 	return
 }
+
+func (ti TableInfo) q20CalcHelperTopSum(q20Map [][]map[string]map[PairInt]int32, items []*LineItem) {
+	var nationKey int8
+	var color string
+	for _, item := range items {
+		if item.L_SHIPDATE.YEAR >= 1993 && item.L_SHIPDATE.YEAR <= 1997 {
+			color, nationKey = ti.Tables.ColorsOfPart[item.L_PARTKEY][0], ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+			q20Map[nationKey][item.L_SHIPDATE.YEAR-1993][color][PairInt{first: item.L_PARTKEY, second: item.L_SUPPKEY}] += int32(item.L_QUANTITY)
+		}
+	}
+}
+
+/*func (ti TableInfo) q20CalcHelperTopSum(q20Map map[int8]map[int16]map[string]map[PairInt]int32, items []*LineItem) {
+//var part *Part
+//var spaceIndex int
+var nationKey int8
+var color string
+for _, item := range items {
+	if item.L_SHIPDATE.YEAR >= 1993 && item.L_SHIPDATE.YEAR <= 1997 {
+		/*part = ti.Tables.Parts[item.L_PARTKEY]
+		spaceIndex, nationKey = strings.Index(part.P_NAME, " "), ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+		color = part.P_NAME[:spaceIndex]
+*/ /*
+			color, nationKey = ti.Tables.ColorsOfPart[item.L_PARTKEY][0], ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+			q20Map[nationKey][item.L_SHIPDATE.YEAR][color][PairInt{first: item.L_PARTKEY, second: item.L_SUPPKEY}] += int32(item.L_QUANTITY)
+		}
+	}
+}*/
 
 func (ti TableInfo) q20CalcHelper(q20Map map[int8]map[string]map[PairInt]map[int16]int32, items []*LineItem) {
 	var part *Part
@@ -3531,14 +4088,302 @@ func (ti TableInfo) q20CalcHelper(q20Map map[int8]map[string]map[PairInt]map[int
 	for _, item := range items {
 		if item.L_SHIPDATE.YEAR >= 1993 && item.L_SHIPDATE.YEAR <= 1997 {
 			part = ti.Tables.Parts[item.L_PARTKEY]
-			spaceIndex, nationKey = strings.Index(part.P_NAME, " "), ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+			//spaceIndex, nationKey = strings.Index(part.P_NAME, " "), ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
+			spaceIndex, nationKey = strings.IndexRune(part.P_NAME, ' '), ti.Tables.SupplierkeyToNationkey(item.L_SUPPKEY)
 			color = part.P_NAME[:spaceIndex]
 			q20Map[nationKey][color][PairInt{first: item.L_PARTKEY, second: item.L_SUPPKEY}][item.L_SHIPDATE.YEAR] += int32(item.L_QUANTITY)
 		}
 	}
 }
 
+func (ti TableInfo) makeQ20IndexUpdsLocalTopSumRoutine(natMap [][]map[string]map[PairInt]int32, region int8, bucketI int, replyChan chan PairUpdsNUpds) {
+	upds, nUpds := ti.makeQ20IndexUpdsLocalTopSum(natMap, region, bucketI)
+	replyChan <- PairUpdsNUpds{upds: upds, nUpds: nUpds}
+}
+
+// Need a separate version because we have to fetch the nationIDs from ti.Tables.NationsByRegion (as we use a slice for the nations)
+func (ti TableInfo) makeQ20IndexUpdsLocalTopSum(q20Map [][]map[string]map[PairInt]int32, region int8, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, len(q20Map)*5*2) //1 CRDT per pair of nation, year (5 years). *2 to give space to TopKInit.
+	var currTopUpd crdt.TopSAddAll
+	var yearUpd crdt.EmbMapUpdateAllArray
+	topI, i, suppsOffset := 0, 0, int32(len(ti.Tables.Suppliers))/4
+	yearsString := []string{"1993", "1994", "1995", "1996", "1997"}
+	topKInit := crdt.TopSInit(300) //Plenty more than what is actually stored.
+	natIndexToIds, natId := ti.Tables.NationsByRegion[region], int8(0)
+
+	//Inits
+	for natI, _ := range q20Map {
+		natId = natIndexToIds[natI]
+		for _, year := range yearsString {
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(ti.Tables.Colors))}
+			for j, color := range ti.Tables.Colors {
+				yearUpd.Upds[j] = crdt.EmbMapUpdate{Key: color, Upd: topKInit}
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + year,
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+
+	k := 0
+	for natI, natMap := range q20Map {
+		natId = natIndexToIds[natI]
+		for yearI, yearMap := range natMap {
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(yearMap))}
+			k = 0
+			for color, colorMap := range yearMap {
+				topI, currTopUpd = 0, crdt.TopSAddAll{Scores: make([]crdt.TopKScore, 5*len(colorMap)/6)} //Most pairs will only have 2-3 years
+				for pair, count := range colorMap {
+					if count == 0 { //Will happen often.
+						continue
+					}
+					currTopUpd.Scores[topI] = crdt.TopKScore{Id: pair.first*4 + pair.second/suppsOffset, Score: count, Data: ti.packQ20IndexExtraData(pair.first, pair.second)}
+					topI++
+				}
+				currTopUpd.Scores = currTopUpd.Scores[:topI]
+				yearUpd.Upds[k] = crdt.EmbMapUpdate{Key: color, Upd: currTopUpd}
+				k++
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + yearsString[yearI],
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+	return
+
+}
+
+func (ti TableInfo) makeQ20IndexUpdsTopSum(q20Map [][]map[string]map[PairInt]int32, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, len(q20Map)*5*2) //1 CRDT per pair of nation, year (5 years). *2 to give space to TopKInit.
+	var currTopUpd crdt.TopSAddAll
+	var yearUpd crdt.EmbMapUpdateAllArray
+	topI, i, suppsOffset := 0, 0, int32(len(ti.Tables.Suppliers))/4
+	yearsString := []string{"1993", "1994", "1995", "1996", "1997"}
+	topKInit := crdt.TopSInit(300) //Plenty more than what is actually stored.
+
+	//Inits
+	for natId, _ := range q20Map {
+		for _, year := range yearsString {
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(ti.Tables.Colors))}
+			for j, color := range ti.Tables.Colors {
+				yearUpd.Upds[j] = crdt.EmbMapUpdate{Key: color, Upd: topKInit}
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + year,
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+
+	k := 0
+	for natId, natMap := range q20Map {
+		for yearI, yearMap := range natMap {
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(yearMap))}
+			k = 0
+			for color, colorMap := range yearMap {
+				topI, currTopUpd = 0, crdt.TopSAddAll{Scores: make([]crdt.TopKScore, 5*len(colorMap)/6)} //Most pairs will only have 2-3 years
+				for pair, count := range colorMap {
+					if count == 0 { //Will happen often.
+						continue
+					}
+					currTopUpd.Scores[topI] = crdt.TopKScore{Id: pair.first*4 + pair.second/suppsOffset, Score: count, Data: ti.packQ20IndexExtraData(pair.first, pair.second)}
+					topI++
+				}
+				currTopUpd.Scores = currTopUpd.Scores[:topI]
+				yearUpd.Upds[k] = crdt.EmbMapUpdate{Key: color, Upd: currTopUpd}
+				k++
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + yearsString[yearI],
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+	return
+}
+
+/*func (ti TableInfo) makeQ20IndexUpdsTopSum(q20Map map[int8]map[int16]map[string]map[PairInt]int32, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+upds = make([]crdt.UpdateObjectParams, len(q20Map)*5*2) //1 CRDT per pair of nation, year (5 years). *2 to give space to TopKInit.
+var currTopUpd crdt.TopSAddAll
+//var yearUpd crdt.EmbMapUpdateAll
+var yearUpd crdt.EmbMapUpdateAllArray
+topI, i, suppsOffset := 0, 0, int32(len(ti.Tables.Suppliers))/4
+yearsString := []string{"1993", "1994", "1995", "1996", "1997"}
+topKInit := crdt.TopSInit(300) //Plenty more than what is actually stored.
+
+//Inits
+for natId, _ := range q20Map {
+	for _, year := range yearsString {
+		/*yearUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(ti.Tables.Colors))}
+		for _, color := range ti.Tables.Colors {
+			yearUpd.Upds[color] = topKInit
+			nUpds++
+		}*/ /*
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(ti.Tables.Colors))}
+			for j, color := range ti.Tables.Colors {
+				yearUpd.Upds[j] = crdt.EmbMapUpdate{Key: color, Upd: topKInit}
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + year,
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+
+	k := 0
+	for natId, natMap := range q20Map {
+		for year, yearMap := range natMap {
+			/*yearUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(yearMap))}
+			for color, colorMap := range yearMap {
+				topI, currTopUpd = 0, crdt.TopSAddAll{Scores: make([]crdt.TopKScore, 5*len(colorMap)/6)} //Most pairs will only have 2-3 years
+				for pair, count := range colorMap {
+					if count == 0 { //Will happen often.
+						continue
+					}
+					currTopUpd.Scores[topI] = crdt.TopKScore{Id: pair.first*4 + pair.second/suppsOffset, Score: count, Data: ti.packQ20IndexExtraData(pair.first, pair.second)}
+					topI++
+				}
+				currTopUpd.Scores = currTopUpd.Scores[:topI]
+				yearUpd.Upds[color] = currTopUpd
+				nUpds++
+			}*/ /*
+			yearUpd = crdt.EmbMapUpdateAllArray{Upds: make([]crdt.EmbMapUpdate, len(yearMap))}
+			k = 0
+			for color, colorMap := range yearMap {
+				topI, currTopUpd = 0, crdt.TopSAddAll{Scores: make([]crdt.TopKScore, 5*len(colorMap)/6)} //Most pairs will only have 2-3 years
+				for pair, count := range colorMap {
+					if count == 0 { //Will happen often.
+						continue
+					}
+					currTopUpd.Scores[topI] = crdt.TopKScore{Id: pair.first*4 + pair.second/suppsOffset, Score: count, Data: ti.packQ20IndexExtraData(pair.first, pair.second)}
+					topI++
+				}
+				currTopUpd.Scores = currTopUpd.Scores[:topI]
+				yearUpd.Upds[k] = crdt.EmbMapUpdate{Key: color, Upd: currTopUpd}
+				k++
+				nUpds++
+			}
+			upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + yearsString[year-1993],
+				CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: yearUpd}
+			i++
+		}
+	}
+	return
+}*/
+
+func (ti TableInfo) makeQ20IndexUpdsNew(q20Map map[int8]map[string]map[PairInt]map[int16]int32, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, len(q20Map)*5) //1 CRDT per pair of nation, year (5 years)
+	//var colorMapUpd crdt.EmbMapUpdateAll
+	natYearMapUpds := make([]crdt.EmbMapUpdateAll, 5) //1993-1997
+	var sup Supplier
+	var partsup PartSupp
+	var availQtyBuf []byte
+	var idsString string
+	updI := 0
+	start := time.Now().UnixNano()
+	yearsString := []string{"1993", "1994", "1995", "1996", "1997"}
+	if false {
+		fmt.Println(sup)
+	}
+
+	for natId, natMap := range q20Map {
+		for i := range natYearMapUpds {
+			natYearMapUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(natMap))}
+		}
+		for color, colorMap := range natMap {
+			for i := range natYearMapUpds {
+				natYearMapUpds[i].Upds[color] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(colorMap))}
+			}
+			for pairInfo, yearMap := range colorMap {
+				sup, partsup = *ti.Tables.Suppliers[pairInfo.second], *ti.Tables.GetPartSuppOfLineitem(pairInfo.first, pairInfo.second)
+				availQtyBuf = make([]byte, 4)
+				binary.LittleEndian.PutUint32(availQtyBuf, uint32(partsup.PS_AVAILQTY))
+				idsString = strconv.FormatInt(int64(pairInfo.first), 10) + "_" + strconv.FormatInt(int64(pairInfo.second), 10)
+				for year, value := range yearMap {
+					//natYearMapUpds[year-1993].Upds[color].(crdt.EmbMapUpdateAll).Upds[idsString] = crdt.MultiArrayUpdateAll{
+					//	Ints: []int64{int64(value)}, Data: [][]byte{[]byte("a"), []byte("a"), availQtyBuf}}
+					natYearMapUpds[year-1993].Upds[color].(crdt.EmbMapUpdateAll).Upds[idsString] = crdt.MultiArrayUpdateAll{
+						Ints: []int64{int64(value)}, Data: [][]byte{[]byte(sup.S_NAME), []byte(sup.S_ADDRESS), availQtyBuf}}
+				}
+				nUpds++
+			}
+		}
+		for k, mapUpd := range natYearMapUpds {
+			upds[updI+k] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{
+				Key: Q20_KEY + strconv.FormatInt(int64(natId), 10) + yearsString[k], CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: mapUpd}
+		}
+		updI += len(natYearMapUpds)
+	}
+	end := time.Now().UnixNano()
+	fmt.Printf("[Q20][MakeIndexUpds]Time taken: %d ms\n", (end-start)/1000000)
+	return
+}
+
 func (ti TableInfo) makeQ20IndexUpds(q20Map map[int8]map[string]map[PairInt]map[int16]int32, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
+	upds = make([]crdt.UpdateObjectParams, len(q20Map)) //1 crdt per Nation
+	var natMapUpd, colorMapUpd crdt.EmbMapUpdateAll
+	var pairArrayUpd crdt.MultiArrayUpdateAll
+	var sup Supplier
+	var partsup PartSupp
+	var availQtyBuf []byte
+	i := 0
+	start := time.Now().UnixNano()
+	if false {
+		fmt.Println(sup)
+	}
+	//Map[nation]->Map[color]->Map[partkey+supplierkey]->MultiArray(reg[supplierName, supplierAddress, availQty], count[sum]) (sum: one sum per year)
+	for natId, natMap := range q20Map {
+		natMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(natMap))}
+		for color, colorMap := range natMap {
+			colorMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(colorMap))}
+			for pairInfo, yearMap := range colorMap {
+				sup, partsup = *ti.Tables.Suppliers[pairInfo.second], *ti.Tables.GetPartSuppOfLineitem(pairInfo.first, pairInfo.second)
+				availQtyBuf = make([]byte, 4)
+				binary.LittleEndian.PutUint32(availQtyBuf, uint32(partsup.PS_AVAILQTY))
+				//pairArrayUpd = crdt.MultiArrayUpdateAll{Ints: make([]int64, 5), Data: [][]byte{[]byte(sup.S_NAME), []byte(sup.S_ADDRESS), availQtyBuf}} //5 years.
+				pairArrayUpd = crdt.MultiArrayUpdateAll{Ints: make([]int64, 5), Data: [][]byte{[]byte("a"), []byte("a"), availQtyBuf}} //5 years.
+				for year, value := range yearMap {
+					pairArrayUpd.Ints[year-1993] = int64(value)
+				}
+				nUpds++
+				colorMapUpd.Upds[strconv.FormatInt(int64(pairInfo.first), 10)+"_"+strconv.FormatInt(int64(pairInfo.second), 10)] = pairArrayUpd
+			}
+			//With low SFs it may happen there's no entries for the color
+			if len(colorMapUpd.Upds) > 0 {
+				natMapUpd.Upds[color] = colorMapUpd
+			}
+		}
+		upds[i] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q20_KEY + strconv.FormatInt(int64(natId), 10), CrdtType: proto.CRDTType_RRMAP, Bucket: Buckets[bucketI]}, UpdateArgs: natMapUpd}
+		i++
+	}
+	end := time.Now().UnixNano()
+	fmt.Printf("[Q20][MakeIndexUpds]Time taken: %d ms\n", (end-start)/1000000)
+	return
+}
+
+func (ti TableInfo) packQ20IndexExtraData(partKey, suppKey int32) (data *[]byte) {
+	sup, partSup := *ti.Tables.Suppliers[suppKey], *ti.Tables.GetPartSuppOfLineitem(partKey, suppKey)
+	buf := make([]byte, len(sup.S_NAME)+len(sup.S_ADDRESS)+9) //+9: 4 bytes for availQty, 4 bytes for suppKey, 1 byte for "_"
+	binary.LittleEndian.PutUint32(buf, uint32(partSup.PS_AVAILQTY))
+	binary.LittleEndian.PutUint32(buf, uint32(suppKey))
+	copy(buf[8:], sup.S_NAME)
+	buf[8+len(sup.S_NAME)] = '_'
+	copy(buf[8+len(sup.S_NAME)+1:], sup.S_ADDRESS)
+	return &buf
+}
+
+func UnpackQ20IndexExtraData(data []byte) (availQty int32, suppKey int32, name, address string) {
+	availQty = int32(binary.LittleEndian.Uint32(data[0:4]))
+	suppKey = int32(binary.LittleEndian.Uint32(data[4:8]))
+	rest := string(data[8:])
+	splitIndex := strings.Index(rest, "_")
+	name, address = rest[:splitIndex], rest[splitIndex+1:]
+	return
+}
+
+/*func (ti TableInfo) makeQ20IndexUpds(q20Map map[int8]map[string]map[PairInt]map[int16]int32, bucketI int) (upds []crdt.UpdateObjectParams, nUpds int) {
 	upds = make([]crdt.UpdateObjectParams, len(q20Map)) //1 crdt per Nation
 	var natMapUpd, colorMapUpd, pairMapUpd crdt.EmbMapUpdateAll
 	var sup *Supplier
@@ -3556,10 +4401,14 @@ func (ti TableInfo) makeQ20IndexUpds(q20Map map[int8]map[string]map[PairInt]map[
 				pairMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 3+len(yearMap))}
 				pairMapUpd.Upds[Q20_NAME], pairMapUpd.Upds[Q20_ADDRESS] = crdt.SetValue{NewValue: sup.S_NAME}, crdt.SetValue{NewValue: sup.S_ADDRESS}
 				pairMapUpd.Upds[Q20_AVAILQTY] = crdt.Increment{Change: partsup.PS_AVAILQTY}
+				lineItemAmounts, k := make([]int32, len(yearMap)), 0
 				for year, value := range yearMap {
 					pairMapUpd.Upds[strconv.FormatInt(int64(year), 10)] = crdt.Increment{Change: value}
+					lineItemAmounts[k] = value
+					k++
 				}
 				nUpds++
+				fmt.Printf("[Q20][MakeIndexUpds]Nation %d, color %s, supplier %d, part %d. SuppQuantity %d, itemQuantity %v\n", natId, color, pairInfo.second, pairInfo.first, partsup.PS_AVAILQTY, lineItemAmounts)
 				//fmt.Printf("[Q20][MakeIndexUpds]Entries for pairInfo %+v: %d. This should be okay though as we have %d updates for this entry.\n",
 				//pairInfo, len(yearMap), len(pairMapUpd.Upds))
 				colorMapUpd.Upds[strconv.FormatInt(int64(pairInfo.first), 10)+"_"+strconv.FormatInt(int64(pairInfo.second), 10)] = pairMapUpd
@@ -3573,7 +4422,7 @@ func (ti TableInfo) makeQ20IndexUpds(q20Map map[int8]map[string]map[PairInt]map[
 		i++
 	}
 	return
-}
+}*/
 
 /*
 func (ti TableInfo) createQ20Map() (q20Map map[int8]map[string]map[int16]map[PairInt]int32) {
@@ -3725,11 +4574,13 @@ func (ti TableInfo) prepareQ22IndexLocal() (upds [][]crdt.UpdateObjectParams, up
 	for _, cust := range ti.Customers[1:] {
 		regKey = ti.Tables.Nations[cust.C_NATIONKEY].N_REGIONKEY
 		regQ22Map[regKey][cust.C_NATIONKEY+10][cust.C_CUSTKEY] = 0
+		q22CustMap[cust.C_CUSTKEY] = 0
 		updsDone[regKey]++
 	}
 	for _, order := range orders {
 		natKey = ti.Tables.OrderToNationkey(order)
 		regQ22Map[ti.Tables.Nations[natKey].N_REGIONKEY][natKey+10][order.O_CUSTKEY]++
+		q22CustMap[order.O_CUSTKEY]++
 	}
 	ti.q22CalcHelper() //Fill up q22CustNatBalances
 	upds = make([][]crdt.UpdateObjectParams, len(ti.Tables.Regions))
@@ -3747,14 +4598,19 @@ func (ti TableInfo) prepareQ22Index() (upds []crdt.UpdateObjectParams, updsDone 
 	//So no need to check the phone - just check the nationID and add 10.
 	//Map[country]->Map[custID]->(orderCount, acctbal)
 	//Map[country]->Avg(acctbal)
-	//The average and the map of customers will be stored together in one CRDT for efficiency
+	//Average and customers are stored in separate CRDTs as this query is split in two parts (2 RTTs)
+	//Also, for further efficiency, customers' map is actually like this:
+	//Map[country_0] -> Map[custID] -> acctbal (map for customers with no orders)
+	//Map[country_1] -> Map[custID] -> Pair(orderCount, acctbal) (map for customers with orders)
 	q22Map, orders := ti.createQ22Map(), ti.getOrders()
 	//To force the customers who have no orders to still show up on q22Map
 	for _, cust := range ti.Customers[1:] {
 		q22Map[cust.C_NATIONKEY+10][cust.C_CUSTKEY] = 0
+		q22CustMap[cust.C_CUSTKEY] = 0
 	}
 	for _, order := range orders {
 		q22Map[ti.Tables.OrderToNationkey(order)+10][order.O_CUSTKEY]++
+		q22CustMap[order.O_CUSTKEY]++
 	}
 	ti.q22CalcHelper() //Fill up q22CustNatBalances
 	//Number of updates is len(ti.Tables.Customers) + len(ti.Tables.Nations) (last one is for the averages)
@@ -3766,7 +4622,7 @@ func (ti TableInfo) q22CalcHelper() {
 	var balance float64
 	var pair PairIntFloat
 	for _, cust := range ti.Tables.Customers[1:] {
-		balance, _ = strconv.ParseFloat(cust.C_ACCTBAL, 64)
+		balance = cust.C_ACCTBAL
 		if balance > 0 {
 			pair = q22CustNatBalances[cust.C_NATIONKEY+10]
 			pair.first += balance
@@ -3777,16 +4633,17 @@ func (ti TableInfo) q22CalcHelper() {
 }
 
 func (ti TableInfo) createQ22Map() (q22Map map[int8]map[int32]int32) {
-	q22Map = make(map[int8]map[int32]int32, len(ti.Tables.Nations))
+	q22Map, q22CustMap = make(map[int8]map[int32]int32, len(ti.Tables.Nations)), make(map[int32]int32, len(ti.Tables.Customers))
 	for natID := range ti.Tables.Nations {
 		q22Map[int8(natID+10)] = make(map[int32]int32, len(ti.Tables.Customers)/(len(ti.Tables.Nations)*2)) //TODO: Better heuristic? Only customers with positive balance counut.
 	}
 	return
 }
 
+// Note: Also creates q22Map, which will be used later by updates.
 func (ti TableInfo) createLocalQ22Map() (regQ22Map []map[int8]map[int32]int32) {
 	//regionID->nationID->customerID->orderCount
-	regQ22Map = make([]map[int8]map[int32]int32, len(ti.Tables.Regions))
+	regQ22Map, q22CustMap = make([]map[int8]map[int32]int32, len(ti.Tables.Regions)), make(map[int32]int32, len(ti.Tables.Customers))
 	for regID, nats := range ti.NationsByRegion {
 		currQ22Map := make(map[int8]map[int32]int32, 5) //5 nations per region
 		for _, natID := range nats {
@@ -3798,7 +4655,87 @@ func (ti TableInfo) createLocalQ22Map() (regQ22Map []map[int8]map[int32]int32) {
 }
 
 func (ti TableInfo) makeQ22LocalIndexUpds(q22Map map[int8]map[int32]int32, regionID, bucketI int) (upds []crdt.UpdateObjectParams) {
-	regMapUpds := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 2*len(q22Map))}
+	regMapAvgUpds, regMapCustUpds := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}
+	nRanges := int64(MAX_CUST_BAL / Q22_SPLIT_FACTOR)
+
+	var pair PairIntFloat
+	var acctbal float64
+	var natIdAvgString, natIdCust0String, natIdCust1String, custIdString string
+	var natMap0Upd, natMap1Upd crdt.EmbMapUpdateAll
+	var natArrayUpd crdt.MultiArrayIncAvg
+	var arrayPos int
+
+	for natId, custMap := range q22Map { //0: no orders. 1: 1+ orders. 2: counterArray
+		natIdAvgString = strconv.FormatInt(int64(natId), 10)
+		natIdCust0String, natIdCust1String = natIdAvgString+"_0", natIdAvgString+"_1"
+		natMap0Upd, natMap1Upd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/2)}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		for i := int64(0); i < nRanges; i++ { //The map of customers with 0 orders is organized by "balance bracket".
+			natMap0Upd.Upds[strconv.FormatInt(i, 10)] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/int(2*nRanges))}
+		}
+		for i := int64(-1); i*Q22_SPLIT_FACTOR > MIN_CUST_BAL; i-- {
+			natMap0Upd.Upds[strconv.FormatInt(i, 10)] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/int(2*nRanges))} //For negative balances.
+		}
+
+		natArrayUpd = crdt.MultiArrayIncAvg{Value: make([]int64, nRanges), Count: make([]int32, nRanges)}
+		pair = q22CustNatBalances[natId]
+		for custId, nOrders := range custMap {
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
+			custIdString = strconv.FormatInt(int64(custId), 10)
+			if nOrders == 0 {
+				arrayPos = int(acctbal / Q22_SPLIT_FACTOR)
+				natMap0Upd.Upds[strconv.Itoa(arrayPos)].(crdt.EmbMapUpdateAll).Upds[custIdString] = crdt.IncrementFloat{Change: acctbal}
+				if arrayPos >= 0 { //Ignore if balance is negative
+					natArrayUpd.Value[arrayPos] += int64(acctbal * 100)
+					natArrayUpd.Count[arrayPos]++
+				}
+			} else {
+				natMap1Upd.Upds[custIdString] = crdt.IncrementBoth{ChangeFirst: nOrders, ChangeSecond: acctbal}
+			}
+		}
+		for i := nRanges - 2; i >= 0; i-- { //For each position, add the one in front. Start at nRanges - 2 (as the last position remains unchanged.)
+			natArrayUpd.Value[i] += natArrayUpd.Value[i+1]
+			natArrayUpd.Count[i] += natArrayUpd.Count[i+1]
+		}
+		//fmt.Printf("[Q22]Nation %d. Value: %v. Count: %v\n", natId, natArrayUpd.Value, natArrayUpd.Count)
+		natMap0Upd.Upds[Q22_ARRAY_KEY] = natArrayUpd
+		regMapAvgUpds.Upds[natIdAvgString], regMapCustUpds.Upds[natIdCust0String], regMapCustUpds.Upds[natIdCust1String] =
+			crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}, natMap0Upd, natMap1Upd
+	}
+	return []crdt.UpdateObjectParams{
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapCustUpds},
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds}}
+}
+
+func (ti TableInfo) makeQ22LocalIndexUpdsOld(q22Map map[int8]map[int32]int32, regionID, bucketI int) (upds []crdt.UpdateObjectParams) {
+	regMapAvgUpds, regMapCustUpds := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}
+
+	var natMap0Upd, natMap1Upd crdt.EmbMapUpdateAll
+	var pair PairIntFloat
+	var acctbal float64
+	var natIdAvgString, natIdCust0String, natIdCust1String, custIdString string
+	for natId, custMap := range q22Map {
+		natIdAvgString, natIdCust0String, natIdCust1String = strconv.FormatInt(int64(natId), 10), strconv.FormatInt(int64(natId), 10)+"_0", strconv.FormatInt(int64(natId), 10)+"_1"
+		natMap0Upd, natMap1Upd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/2)}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		pair = q22CustNatBalances[natId]
+		for custId, nOrders := range custMap {
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
+			custIdString = strconv.FormatInt(int64(custId), 10)
+			if nOrders == 0 {
+				natMap0Upd.Upds[custIdString] = crdt.IncrementFloat{Change: acctbal}
+			} else {
+				natMap1Upd.Upds[custIdString] = crdt.IncrementBoth{ChangeFirst: nOrders, ChangeSecond: acctbal}
+			}
+		}
+		regMapAvgUpds.Upds[natIdAvgString], regMapCustUpds.Upds[natIdCust0String], regMapCustUpds.Upds[natIdCust1String] =
+			crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}, natMap0Upd, natMap1Upd
+	}
+	return []crdt.UpdateObjectParams{
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapCustUpds},
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds}}
+}
+
+/*func (ti TableInfo) makeQ22LocalIndexUpds(q22Map map[int8]map[int32]int32, regionID, bucketI int) (upds []crdt.UpdateObjectParams) {
+	regMapAvgUpds, regMapCustUpds := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(q22Map))}
 
 	var natMapUpd crdt.EmbMapUpdateAll
 	var pair PairIntFloat
@@ -3810,6 +4747,169 @@ func (ti TableInfo) makeQ22LocalIndexUpds(q22Map map[int8]map[int32]int32, regio
 		pair, natIdString = q22CustNatBalances[natId], strconv.FormatInt(int64(natId), 10)
 		for custId, nOrders := range custMap {
 			acctbal, _ = strconv.ParseFloat(ti.Tables.Customers[custId].C_ACCTBAL, 64)
+			natMapUpd.Upds[strconv.FormatInt(int64(custId), 10)] = crdt.EmbMapUpdateAll{Upds: map[string]crdt.UpdateArguments{"C": crdt.Increment{Change: nOrders}, "A": crdt.IncrementFloat{Change: acctbal}}}
+		}
+		regMapCustUpds.Upds[natIdString], regMapAvgUpds.Upds[natIdString] = natMapUpd, crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}
+	}
+	return []crdt.UpdateObjectParams{
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapCustUpds},
+		{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds}}
+}*/
+
+// New version with 3 CRDTs per region, for customer data:
+// 1: cust with 1+ orders (_1)
+// 2: cust with 0 orders, grouped by "range"
+// 3: multiArray with sum (and count) of balances of customers with 0 orders, per range
+// (2) and (3) are grouped together under (_0). The range is defined as [i*Q22_SPLIT_FACTOR, (i+1)*Q22_SPLIT_FACTOR)]
+// The layout is like this: natId_0 -> (([range]->(custId->balance)),array) (i.e., customers are under [range], but array is not)
+// The idea is that, for any average value, most costumers will be already "summed" (and counted) in a range of multiArray
+// Then, only a few customers will be needed to be read from the cust with 0 orders map.
+// This should speed up query processing considerably.
+// TODO: Local, query, update.
+func (ti TableInfo) makeQ22IndexUpds(q22Map map[int8]map[int32]int32, bucketI int) (upds []crdt.UpdateObjectParams) {
+	upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Regions)*2) //2 CRDT per region: 1 for the map of customers, 1 for the averages
+	regMapAvgUpds, regMapCustUpds := make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions)), make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions))
+	for i := range regMapAvgUpds {
+		regMapAvgUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5)}    //There's 5 nations per region.
+		regMapCustUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5*2)} //*2: cust with 0 orders, cust with 1+ orders
+	}
+	nRanges := int64(MAX_CUST_BAL / Q22_SPLIT_FACTOR)
+
+	var pair PairIntFloat
+	var acctbal float64
+	var natIdAvgString, natIdCust0String, natIdCust1String, custIdString string
+	var natMap0Upd, natMap1Upd, currRegCustUpds crdt.EmbMapUpdateAll
+	var natArrayUpd crdt.MultiArrayIncAvg
+	var arrayPos int
+	for natId, custMap := range q22Map { //0: no orders. 1: 1+ orders. 2: counterArray
+		natIdAvgString = strconv.FormatInt(int64(natId), 10)
+		natIdCust0String, natIdCust1String = natIdAvgString+"_0", natIdAvgString+"_1"
+		natMap0Upd, natMap1Upd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, nRanges+1)}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		for i := int64(0); i < nRanges; i++ { //The map of customers with 0 orders is organized by "balance bracket".
+			//fmt.Println(i)
+			natMap0Upd.Upds[strconv.FormatInt(i, 10)] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/int(2*nRanges))}
+		}
+		for i := int64(-1); i*Q22_SPLIT_FACTOR > MIN_CUST_BAL; i-- {
+			natMap0Upd.Upds[strconv.FormatInt(i, 10)] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/int(2*nRanges))} //For negative balances.
+		}
+
+		//fmt.Println()
+		natArrayUpd = crdt.MultiArrayIncAvg{Value: make([]int64, nRanges), Count: make([]int32, nRanges)}
+		pair = q22CustNatBalances[natId]
+		for custId, nOrders := range custMap {
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
+			custIdString = strconv.FormatInt(int64(custId), 10)
+			if nOrders == 0 {
+				arrayPos = int(acctbal / Q22_SPLIT_FACTOR)
+				//fmt.Printf("ArrayPos: %d\n", arrayPos)
+				natMap0Upd.Upds[strconv.Itoa(arrayPos)].(crdt.EmbMapUpdateAll).Upds[custIdString] = crdt.IncrementFloat{Change: acctbal}
+				if arrayPos >= 0 { //Ignore if balance is negative
+					natArrayUpd.Value[arrayPos] += int64(acctbal * 100)
+					natArrayUpd.Count[arrayPos]++
+				}
+			} else {
+				natMap1Upd.Upds[custIdString] = crdt.IncrementBoth{ChangeFirst: nOrders, ChangeSecond: acctbal}
+			}
+		}
+		for i := nRanges - 2; i >= 0; i-- { //For each position, add the one in front. Start at nRanges - 2 (as the last position remains unchanged.)
+			natArrayUpd.Value[i] += natArrayUpd.Value[i+1]
+			natArrayUpd.Count[i] += natArrayUpd.Count[i+1]
+		}
+		//fmt.Printf("[Q22Index]Value: %v\nCount: %v\n", natArrayUpd.Value, natArrayUpd.Count)
+		natMap0Upd.Upds[Q22_ARRAY_KEY] = natArrayUpd
+		regMapAvgUpds[ti.Tables.Nations[natId-10].N_REGIONKEY].Upds[natIdAvgString] = crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}
+		currRegCustUpds = regMapCustUpds[ti.Tables.Nations[natId-10].N_REGIONKEY]
+		currRegCustUpds.Upds[natIdCust0String], currRegCustUpds.Upds[natIdCust1String] = natMap0Upd, natMap1Upd
+	}
+	for i, regMap := range regMapCustUpds {
+		upds[i*2] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMap}
+		upds[i*2+1] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds[i]}
+	}
+	return upds
+}
+
+func (ti TableInfo) makeQ22IndexUpdsOld(q22Map map[int8]map[int32]int32, bucketI int) (upds []crdt.UpdateObjectParams) {
+	upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Regions)*2) //2 CRDT per region: 1 for the map of customers, 1 for the averages
+	regMapAvgUpds, regMapCustUpds := make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions)), make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions))
+	for i := range regMapAvgUpds {
+		regMapAvgUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5)}    //There's 5 nations per region.
+		regMapCustUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5*2)} //*2: cust with 0 orders, cust with 1+ orders
+	}
+
+	var pair PairIntFloat
+	var acctbal float64
+	var natIdAvgString, natIdCust0String, natIdCust1String, custIdString string
+	var natMap0Upd, natMap1Upd, currRegAvgUpds, currRegCustUpds crdt.EmbMapUpdateAll
+	for natId, custMap := range q22Map {
+		//0: no orders. 1: 1+ orders
+		natIdAvgString, natIdCust0String, natIdCust1String = strconv.FormatInt(int64(natId), 10), strconv.FormatInt(int64(natId), 10)+"_0", strconv.FormatInt(int64(natId), 10)+"_1"
+		natMap0Upd, natMap1Upd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap)/2)}, crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		pair = q22CustNatBalances[natId]
+		for custId, nOrders := range custMap {
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
+			custIdString = strconv.FormatInt(int64(custId), 10)
+			if nOrders == 0 {
+				natMap0Upd.Upds[custIdString] = crdt.IncrementFloat{Change: acctbal}
+			} else {
+				natMap1Upd.Upds[custIdString] = crdt.IncrementBoth{ChangeFirst: nOrders, ChangeSecond: acctbal}
+			}
+			currRegAvgUpds, currRegCustUpds = regMapAvgUpds[ti.Tables.Nations[natId-10].N_REGIONKEY], regMapCustUpds[ti.Tables.Nations[natId-10].N_REGIONKEY]
+			currRegAvgUpds.Upds[natIdAvgString], currRegCustUpds.Upds[natIdCust0String], currRegCustUpds.Upds[natIdCust1String] =
+				crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}, natMap0Upd, natMap1Upd
+		}
+	}
+	for i, regMap := range regMapCustUpds {
+		upds[i*2] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMap}
+		upds[i*2+1] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds[i]}
+	}
+	return upds
+}
+
+/*func (ti TableInfo) makeQ22IndexUpds(q22Map map[int8]map[int32]int32, bucketI int) (upds []crdt.UpdateObjectParams) {
+	upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Regions)*2) //2 CRDT per region: 1 for the map of customers, 1 for the averages
+	regMapAvgUpds, regMapCustUpds := make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions)), make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions))
+	for i := range regMapAvgUpds {
+		regMapAvgUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5)} //There's 5 nations per region.
+		regMapCustUpds[i] = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 5)}
+	}
+	var pair PairIntFloat
+	var acctbal float64
+	var natMapUpd, currRegAvgUpds, currRegCustUpds crdt.EmbMapUpdateAll
+	var natIdString string
+	for natId, custMap := range q22Map {
+		//fmt.Printf("[Q22]MakeQ22IndexUpds. NatId: %d. Number of customers: %d\n", natId, len(custMap))
+		natMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		pair = q22CustNatBalances[natId]
+		for custId, nOrders := range custMap {
+			acctbal, _ = strconv.ParseFloat(ti.Tables.Customers[custId].C_ACCTBAL, 64)
+			natMapUpd.Upds[strconv.FormatInt(int64(custId), 10)] = crdt.EmbMapUpdateAll{Upds: map[string]crdt.UpdateArguments{"C": crdt.Increment{Change: nOrders}, "A": crdt.IncrementFloat{Change: acctbal}}}
+		}
+		currRegAvgUpds, currRegCustUpds, natIdString = regMapAvgUpds[ti.Tables.Nations[natId-10].N_REGIONKEY], regMapCustUpds[ti.Tables.Nations[natId-10].N_REGIONKEY], strconv.FormatInt(int64(natId), 10)
+		currRegCustUpds.Upds[natIdString], currRegAvgUpds.Upds[natIdString] = natMapUpd, crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}
+		fmt.Printf("[INDEX][MakeQ22IndexUpds]Inside map key: %s.\n", natIdString)
+	}
+	for i, regMap := range regMapCustUpds {
+		//fmt.Printf("[Q22]MakeQ22IndexUpds. Region %d. NUpds: %d\n", i, len(regMap.Upds))
+		upds[i*2] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMap}
+		upds[i*2+1] = crdt.UpdateObjectParams{KeyParams: crdt.KeyParams{Key: Q22_KEY + Q22_AVG + strconv.Itoa(i), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapAvgUpds[i]}
+		fmt.Printf("[INDEX][MakeQ22IndexUpds]KeyParams customers: %v. KeyParams avg: %v\n", upds[i*2].KeyParams, upds[i*2+1].KeyParams)
+	}
+	return upds
+}*/
+
+func (ti TableInfo) makeQ22OldLocalIndexUpds(q22Map map[int8]map[int32]int32, regionID, bucketI int) (upds []crdt.UpdateObjectParams) {
+	regMapUpds := crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, 2*len(q22Map))}
+
+	var natMapUpd crdt.EmbMapUpdateAll
+	var pair PairIntFloat
+	var acctbal float64
+	var natIdString string
+	//We already know all natIds are for this region
+	for natId, custMap := range q22Map {
+		natMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
+		pair, natIdString = q22CustNatBalances[natId], strconv.FormatInt(int64(natId), 10)
+		for custId, nOrders := range custMap {
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
 			natMapUpd.Upds[strconv.FormatInt(int64(custId), 10)] = crdt.EmbMapUpdateAll{Upds: map[string]crdt.UpdateArguments{"C": crdt.Increment{Change: nOrders}, "A": crdt.Increment{Change: int32(acctbal)}}}
 		}
 		regMapUpds.Upds[natIdString], regMapUpds.Upds[Q22_AVG+natIdString] = natMapUpd, crdt.AddMultipleValue{SumValue: int64(pair.first), NAdds: pair.second}
@@ -3817,7 +4917,7 @@ func (ti TableInfo) makeQ22LocalIndexUpds(q22Map map[int8]map[int32]int32, regio
 	return []crdt.UpdateObjectParams{{KeyParams: crdt.KeyParams{Key: Q22_KEY + strconv.Itoa(regionID), Bucket: Buckets[bucketI], CrdtType: proto.CRDTType_RRMAP}, UpdateArgs: regMapUpds}}
 }
 
-func (ti TableInfo) makeQ22IndexUpds(q22Map map[int8]map[int32]int32, bucketI int) (upds []crdt.UpdateObjectParams) {
+func (ti TableInfo) makeQ22OldIndexUpds(q22Map map[int8]map[int32]int32, bucketI int) (upds []crdt.UpdateObjectParams) {
 	upds = make([]crdt.UpdateObjectParams, len(ti.Tables.Regions)) //1 CRDT per region
 	regMapUpds := make([]crdt.EmbMapUpdateAll, len(ti.Tables.Regions))
 	for i := range regMapUpds {
@@ -3832,7 +4932,7 @@ func (ti TableInfo) makeQ22IndexUpds(q22Map map[int8]map[int32]int32, bucketI in
 		natMapUpd = crdt.EmbMapUpdateAll{Upds: make(map[string]crdt.UpdateArguments, len(custMap))}
 		pair = q22CustNatBalances[natId]
 		for custId, nOrders := range custMap {
-			acctbal, _ = strconv.ParseFloat(ti.Tables.Customers[custId].C_ACCTBAL, 64)
+			acctbal = ti.Tables.Customers[custId].C_ACCTBAL
 			natMapUpd.Upds[strconv.FormatInt(int64(custId), 10)] = crdt.EmbMapUpdateAll{Upds: map[string]crdt.UpdateArguments{"C": crdt.Increment{Change: nOrders}, "A": crdt.Increment{Change: int32(acctbal)}}}
 		}
 		currRegUpds, natIdString = regMapUpds[ti.Tables.Nations[natId-10].N_REGIONKEY], strconv.FormatInt(int64(natId), 10)

@@ -16,6 +16,7 @@ const (
 	//O_ORDERKEY, O_CUSTKEY                                                = 0, 1
 	C_NATIONKEY, L_SUPPKEY, L_ORDERKEY, N_REGIONKEY, O_CUSTKEY, PS_SUPPKEY, S_NATIONKEY, R_REGIONKEY = 3, 2, 0, 2, 1, 1, 3, 0
 	O_ORDERDATE, C_MKTSEGMENT, L_SHIPDATE, L_EXTENDEDPRICE, L_DISCOUNT, O_SHIPPRIOTITY, O_ORDERKEY   = 4, 6, 10, 5, 6, 5, 0
+	MAX_CUST_BAL, MIN_CUST_BAL                                                                       = 10000.0, -1000.0 //From the TPC-H specification, [-999.99, 9999.99]
 )
 
 //TODO: Might be wise to extend all (or at least customer/orders) with REGIONKEY for faster acessing REGIONKEY when doing queries
@@ -39,7 +40,7 @@ type Customer struct {
 	C_ADDRESS    string
 	C_NATIONKEY  int8
 	C_PHONE      string
-	C_ACCTBAL    string
+	C_ACCTBAL    float64
 	C_MKTSEGMENT string
 	C_COMMENT    string
 }
@@ -176,8 +177,12 @@ type Tables struct {
 	NationsByRegion [][]int8
 
 	//To help with some queries (at the moment, Q9)
-	SortedNationsName         []string
-	SortedNationsNameByRegion [][]string
+	SortedNationsName             []string
+	SortedNationsIds              map[int8]int32 //NatId -> Pos in slice above
+	SortedNationsIdByRegionToFull []int32        //Index: position in the slice below (with offset of region*5). Pos: in SortedNationsName
+	SortedNationIdsByRegion       []map[int8]int32
+	SortedReturnFlagLineStatus    []string //Q1
+	ColorsOfPart                  [][]string
 
 	//Variables as well since they're different depending if we're working on single-server or multi-server modes
 	NationkeyToRegionkey func(int64) int8
@@ -186,6 +191,8 @@ type Tables struct {
 	Custkey32ToRegionkey func(int32) int8
 	OrderkeyToRegionkey  func(int32) int8
 	OrderToRegionkey     func(*Orders) int8
+
+	NOrders int //Stores the number of orders before the tables are read from the disk. Optional, but setting this earlier allows for faster data loading.
 }
 
 //*****Auxiliary data types*****//
@@ -314,42 +321,45 @@ func (date *Date) ToString() string {
 
 func (tab *Tables) GetShallowCopy() (copyTables *Tables) {
 	return &Tables{
-		Customers:                 tab.Customers,
-		LineItems:                 tab.LineItems,
-		Nations:                   tab.Nations,
-		Orders:                    tab.Orders,
-		Parts:                     tab.Parts,
-		PartSupps:                 tab.PartSupps,
-		Regions:                   tab.Regions,
-		Suppliers:                 tab.Suppliers,
-		MaxOrderLineitems:         tab.MaxOrderLineitems,
-		Segments:                  tab.Segments,
-		ReturnFlags:               tab.ReturnFlags,
-		LineStatus:                tab.LineStatus,
-		Types:                     tab.Types,
-		TypesToShortType:          tab.TypesToShortType,
-		ShortType:                 tab.ShortType,
-		MediumType:                tab.MediumType,
-		Colors:                    tab.Colors,
-		Modes:                     tab.Modes,
-		Priorities:                tab.Priorities,
-		Brands:                    tab.Brands,
-		Containers:                tab.Containers,
-		PromoParts:                tab.PromoParts,
-		orderToRegionFun:          tab.orderToRegionFun,
-		orderIndexFun:             tab.orderIndexFun,
-		LastDeletedPos:            tab.LastDeletedPos,
-		LastAddedOrders:           tab.LastAddedOrders,
-		LastAddedLineItems:        tab.LastAddedLineItems,
-		NationkeyToRegionkey:      tab.NationkeyToRegionkey,
-		SuppkeyToRegionkey:        tab.SuppkeyToRegionkey,
-		CustkeyToRegionkey:        tab.CustkeyToRegionkey,
-		Custkey32ToRegionkey:      tab.Custkey32ToRegionkey,
-		OrderkeyToRegionkey:       tab.OrderkeyToRegionkey,
-		OrderToRegionkey:          tab.OrderToRegionkey,
-		NationsByRegion:           tab.NationsByRegion,
-		SortedNationsName:         tab.SortedNationsName,
-		SortedNationsNameByRegion: tab.SortedNationsNameByRegion,
+		Customers:                     tab.Customers,
+		LineItems:                     tab.LineItems,
+		Nations:                       tab.Nations,
+		Orders:                        tab.Orders,
+		Parts:                         tab.Parts,
+		PartSupps:                     tab.PartSupps,
+		Regions:                       tab.Regions,
+		Suppliers:                     tab.Suppliers,
+		MaxOrderLineitems:             tab.MaxOrderLineitems,
+		Segments:                      tab.Segments,
+		ReturnFlags:                   tab.ReturnFlags,
+		LineStatus:                    tab.LineStatus,
+		Types:                         tab.Types,
+		TypesToShortType:              tab.TypesToShortType,
+		ShortType:                     tab.ShortType,
+		MediumType:                    tab.MediumType,
+		Colors:                        tab.Colors,
+		Modes:                         tab.Modes,
+		Priorities:                    tab.Priorities,
+		Brands:                        tab.Brands,
+		Containers:                    tab.Containers,
+		PromoParts:                    tab.PromoParts,
+		orderToRegionFun:              tab.orderToRegionFun,
+		orderIndexFun:                 tab.orderIndexFun,
+		LastDeletedPos:                tab.LastDeletedPos,
+		LastAddedOrders:               tab.LastAddedOrders,
+		LastAddedLineItems:            tab.LastAddedLineItems,
+		NationkeyToRegionkey:          tab.NationkeyToRegionkey,
+		SuppkeyToRegionkey:            tab.SuppkeyToRegionkey,
+		CustkeyToRegionkey:            tab.CustkeyToRegionkey,
+		Custkey32ToRegionkey:          tab.Custkey32ToRegionkey,
+		OrderkeyToRegionkey:           tab.OrderkeyToRegionkey,
+		OrderToRegionkey:              tab.OrderToRegionkey,
+		NationsByRegion:               tab.NationsByRegion,
+		SortedNationsName:             tab.SortedNationsName,
+		SortedNationsIds:              tab.SortedNationsIds,
+		SortedNationsIdByRegionToFull: tab.SortedNationsIdByRegionToFull,
+		SortedNationIdsByRegion:       tab.SortedNationIdsByRegion,
+		SortedReturnFlagLineStatus:    tab.SortedReturnFlagLineStatus,
 	}
 }
 
@@ -376,6 +386,7 @@ func CreateClientTables(rawData [][][]string, singleServer bool) (tables *Tables
 		Brands:            createBrandsList(),
 		Containers:        createContainersList(),
 		PromoParts:        promoParts,
+		ColorsOfPart:      CreateColorsOfParts(parts),
 	}
 	tables.Types, tables.ShortType, tables.MediumType, tables.TypesToShortType, tables.TypesToMediumType = createTypesMap()
 	if !singleServer {
@@ -398,7 +409,9 @@ func CreateClientTables(rawData [][][]string, singleServer bool) (tables *Tables
 	tables.orderIndexFun = tables.getFullOrderIndex
 	tables.LastDeletedPos = 1
 	tables.NationsByRegion = CreateNationsByRegionTable(tables.Nations, tables.Regions)
-	tables.SortedNationsName, tables.SortedNationsNameByRegion = CreateSortedNations(tables.Nations)
+	tables.SortedNationsName, tables.SortedNationsIds, tables.SortedNationsIdByRegionToFull,
+		tables.SortedNationIdsByRegion = CreateSortedNations(tables.Nations)
+	tables.SortedReturnFlagLineStatus = CreateSortedReturnFlagLineStatus()
 	endTime := time.Now().UnixNano() / 1000000
 	fmt.Println("Time taken to process tables:", endTime-startTime, "ms")
 	return
@@ -419,7 +432,9 @@ func (tab *Tables) InitConstants(singleServer bool) {
 	tab.Modes, tab.Priorities = createModesList(), createPrioritiesList()
 	tab.Brands, tab.Containers = createBrandsList(), createContainersList()
 	tab.Types, tab.ShortType, tab.MediumType, tab.TypesToShortType, tab.TypesToMediumType = createTypesMap()
-	tab.SortedNationsName, tab.SortedNationsNameByRegion = CreateSortedNations(tab.Nations)
+	tab.SortedNationsName, tab.SortedNationsIds,
+		tab.SortedNationsIdByRegionToFull, tab.SortedNationIdsByRegion = CreateSortedNations(tab.Nations)
+	tab.SortedReturnFlagLineStatus = CreateSortedReturnFlagLineStatus()
 	tab.orderToRegionFun = tab.orderkeyToRegionkeyMultiple
 	tab.orderIndexFun = tab.getFullOrderIndex
 	tab.LastDeletedPos = 1
@@ -465,15 +480,17 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 	//fmt.Println("Creating customer table")
 	customers = make([]*Customer, len(cTable)+1)
 	var nationKey int64
+	var acctBal float64
 	for i, entry := range cTable {
 		nationKey, _ = strconv.ParseInt(entry[3], 10, 8)
+		acctBal, _ = strconv.ParseFloat(entry[5], 64)
 		customers[i+1] = &Customer{
 			C_CUSTKEY:    int32(i + 1),
 			C_NAME:       entry[1],
 			C_ADDRESS:    entry[2],
 			C_NATIONKEY:  int8(nationKey),
 			C_PHONE:      entry[4],
-			C_ACCTBAL:    entry[5],
+			C_ACCTBAL:    acctBal,
 			C_MKTSEGMENT: entry[6],
 			C_COMMENT:    entry[7],
 		}
@@ -481,8 +498,129 @@ func createCustomerTable(cTable [][]string) (customers []*Customer) {
 	return
 }
 
+func createLineitemTableRoutines(liTable [][]string, nOrders int) (lineItems [][]*LineItem, maxLineItem int32) {
+	//fmt.Println("Creating lineItem table with size", nOrders)
+	start := time.Now().UnixNano()
+	lineItems = make([][]*LineItem, nOrders)
+	maxLineItem = 8
+
+	nRoutines := 24
+	slicePerRoutine := len(liTable) / nRoutines
+	channels := make([]chan [][]*LineItem, nRoutines)
+	for i := 0; i < nRoutines; i++ {
+		channels[i] = make(chan [][]*LineItem, 1)
+	}
+	ranges := make([]int, nRoutines) //Need to find where a given order "ends"
+	ranges[0] = 0                    //For clarity
+	currOffset := slicePerRoutine
+	currOrderKey := liTable[currOffset][0]
+
+	for i := 1; i < nRoutines; i++ {
+		for j := currOffset + 1; j < len(liTable); j++ {
+			if currOrderKey != liTable[j][0] {
+				ranges[i] = j
+				currOffset = j + slicePerRoutine
+				if i < nRoutines-1 {
+					currOrderKey = liTable[currOffset][0]
+				}
+				break
+			}
+		}
+		go helperCreateLineitemTable(liTable[ranges[i-1]:ranges[i]], maxLineItem, channels[i-1])
+	}
+	go helperCreateLineitemTable(liTable[ranges[len(ranges)-1]:], maxLineItem, channels[len(ranges)-1])
+
+	offset := 0
+	for _, channel := range channels { //Ensures replies are received by order
+		toCopy := <-channel
+		offset += copy(lineItems[offset:], toCopy)
+		//offset += len(toCopy)
+	}
+
+	end := time.Now()
+	fmt.Printf("[Tables]Took %d ms to create LineItem processed table, at %s (last index: %d).\n", (end.UnixNano()-start)/1000000, time.Now().Format("15:04:05.000"), offset)
+	return
+}
+
+func helperCreateLineitemTable(liTable [][]string, maxLineItem int32, replyChan chan [][]*LineItem) {
+	lineItems := make([][]*LineItem, len(liTable)/3) //Should be safe.
+	bufItems := make([]*LineItem, maxLineItem+1)
+	var newLine []*LineItem
+
+	var partKey, orderKey, suppKey, lineNumber, quantity int64
+	var convLineNumber int8
+	var convOrderKey int32
+	var extendedPrice, discount, tax float64
+	bufI, bufOrder := 0, 0
+	tmpOrderID, _ := strconv.ParseInt(liTable[0][0], 10, 32)
+	currOrderID := int32(tmpOrderID)
+	for _, entry := range liTable {
+		//Create lineitem
+		orderKey, _ = strconv.ParseInt(entry[0], 10, 32)
+		partKey, _ = strconv.ParseInt(entry[1], 10, 32)
+		suppKey, _ = strconv.ParseInt(entry[2], 10, 32)
+		lineNumber, _ = strconv.ParseInt(entry[3], 10, 8)
+		quantity, _ = strconv.ParseInt(entry[4], 10, 8)
+		convLineNumber, convOrderKey = int8(lineNumber), int32(orderKey)
+		extendedPrice, _ = strconv.ParseFloat(entry[5], 64)
+		discount, _ = strconv.ParseFloat(entry[6], 64)
+		tax, _ = strconv.ParseFloat(entry[7], 64)
+
+		bufItems[bufI] = &LineItem{
+			L_ORDERKEY:      convOrderKey,
+			L_PARTKEY:       int32(partKey),
+			L_SUPPKEY:       int32(suppKey),
+			L_LINENUMBER:    convLineNumber,
+			L_QUANTITY:      int8(quantity),
+			L_EXTENDEDPRICE: extendedPrice,
+			L_DISCOUNT:      discount,
+			L_TAX:           tax,
+			L_RETURNFLAG:    entry[8],
+			L_LINESTATUS:    entry[9],
+			L_SHIPDATE:      createDate(entry[10]),
+			L_COMMITDATE:    createDate(entry[11]),
+			L_RECEIPTDATE:   createDate(entry[12]),
+			L_SHIPINSTRUCT:  entry[13],
+			L_SHIPMODE:      entry[14],
+			L_COMMENT:       entry[15],
+		}
+
+		//Check if it belongs to a new order
+		if convOrderKey != currOrderID {
+			//Add everything in the buffer apart from the new one to the table
+			newLine = make([]*LineItem, bufI)
+			for k, item := range bufItems[:bufI] {
+				newLine[k] = item
+			}
+			lineItems[bufOrder] = newLine
+			bufOrder++
+			bufItems[0] = bufItems[bufI]
+			currOrderID = convOrderKey
+			bufI = 0
+		}
+
+		bufI++
+		//fmt.Println(orderKey)
+	}
+
+	//fmt.Println("Last order for lineitemTable: ", bufItems[bufI-1])
+	//fmt.Println("Last order already in table:", lineItems[bufOrder-1][len(lineItems[bufOrder-1])-1])
+	//fmt.Println(currOrderID, bufOrder)
+	//Last order
+	//fmt.Printf("Last orderID: %s, last orderID already in lineItems: %d, trying to add: %d\n", liTable[len(liTable)-1][0], lineItems[bufOrder-1][0].L_ORDERKEY, currOrderID)
+	newLine = make([]*LineItem, bufI)
+	for k, item := range bufItems[:bufI] {
+		newLine[k] = item
+	}
+	lineItems[bufOrder] = newLine
+	lineItems = lineItems[:bufOrder+1]
+	replyChan <- lineItems
+	close(replyChan)
+}
+
 func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineItem, maxLineItem int32) {
 	//fmt.Println("Creating lineItem table with size", nOrders)
+	start := time.Now().UnixNano()
 	maxLineItem = 8
 
 	lineItems = make([][]*LineItem, nOrders)
@@ -555,6 +693,8 @@ func createLineitemTable(liTable [][]string, nOrders int) (lineItems [][]*LineIt
 		newLine[k] = item
 	}
 	lineItems[bufOrder] = newLine
+	end := time.Now()
+	fmt.Printf("[Tables]Took %d ms to create LineItem processed table, at %s (last index: %d).\n", (end.UnixNano()-start)/1000000, time.Now().Format("15:04:05.123"), bufOrder)
 	return
 }
 
@@ -802,6 +942,7 @@ func createTypesMap() (types, shortTypes, mediumTypes []string, typesToShortType
 		}
 	}
 	shortTypes = syllable3
+	sort.Slice(mediumTypes, func(i, j int) bool { return mediumTypes[i] < mediumTypes[j] })
 	return
 }
 
@@ -841,8 +982,11 @@ func createContainersList() (containers []string) {
 	return
 }
 
-func CreateSortedNations(nations []*Nation) (nats []string, natsRegNat [][]string) {
-	nats, natsRegNat = make([]string, len(nations)), make([][]string, 5)
+func CreateSortedNations(nations []*Nation) (nats []string, natsIds map[int8]int32, natsRegPosInFull []int32, natsRegId []map[int8]int32) {
+	nats, natsIds, natsRegPosInFull, natsRegId = make([]string, len(nations)), make(map[int8]int32, len(nations)), make([]int32, len(nations)), make([]map[int8]int32, 5)
+	tmpNatIds := make([]int8, len(nations))
+	tmpNatRegIds := make([][]int8, 5)
+	tmpNatsRegNat := make([][]string, 5)
 	/*
 		//var currRegNats []string
 		for i, regNatsIds := range regionNations {
@@ -856,15 +1000,49 @@ func CreateSortedNations(nations []*Nation) (nats []string, natsRegNat [][]strin
 		}
 	*/
 	for i, nat := range nations {
-		nats[i] = nat.N_NAME
-		natsRegNat[nat.N_REGIONKEY] = append(natsRegNat[nat.N_REGIONKEY], nat.N_NAME)
+		nats[i], tmpNatIds[i] = nat.N_NAME, nat.N_NATIONKEY
+		tmpNatRegIds[nat.N_REGIONKEY] = append(tmpNatRegIds[nat.N_REGIONKEY], nat.N_NATIONKEY)
+		tmpNatsRegNat[nat.N_REGIONKEY] = append(tmpNatsRegNat[nat.N_REGIONKEY], nat.N_NAME)
 	}
 	//fmt.Println("[TPCHTABLES]CreateSortedNations, nations:", nations)
+	sort.Slice(tmpNatIds, func(i, j int) bool { return nats[i] < nats[j] }) //Sorts IDs by nation name
 	sort.Slice(nats, func(i, j int) bool { return nats[i] < nats[j] })
-	for _, regSlice := range natsRegNat {
+	for i, natId := range tmpNatIds {
+		natsIds[natId] = int32(i)
+	}
+	for k, regSlice := range tmpNatsRegNat {
+		sort.Slice(tmpNatRegIds[k], func(i, j int) bool { return regSlice[i] < regSlice[j] })
 		sort.Slice(regSlice, func(i, j int) bool { return regSlice[i] < regSlice[j] })
+		natsRegId[k] = make(map[int8]int32, len(tmpNatRegIds[k]))
+		for i, natId := range tmpNatRegIds[k] {
+			natsRegId[k][natId] = int32(i)
+			natsRegPosInFull[k*len(tmpNatRegIds)+i] = natsIds[natId] //Assign position in full sorted nation array
+		}
 	}
 	return
+}
+
+func CreateSortedReturnFlagLineStatus() []string {
+	return []string{"AF", "NF", "NO", "RF"} //Order according to alphabetic order
+}
+func CreateColorsOfParts(parts []*Part) (colorsOfPart [][]string) {
+	colorsOfPart = make([][]string, len(parts))
+	nRoutines := 5
+	partsPerRoutine, endChan := (len(parts)-1)/nRoutines, make(chan bool, 5)
+	for i := 0; i < nRoutines-1; i++ {
+		go createColorsOfPartsHelper(parts[i*partsPerRoutine+1:(i+1)*partsPerRoutine+1], colorsOfPart[i*partsPerRoutine+1:(i+1)*partsPerRoutine+1])
+	}
+	go createColorsOfPartsHelper(parts[(nRoutines-1)*partsPerRoutine+1:], colorsOfPart[(nRoutines-1)*partsPerRoutine+1:])
+	for i := 0; i < nRoutines; i++ {
+		endChan <- true
+	}
+	return
+}
+
+func createColorsOfPartsHelper(subParts []*Part, subColorsOfPart [][]string) {
+	for j, part := range subParts {
+		subColorsOfPart[j] = strings.Split(part.P_NAME, " ")
+	}
 }
 
 /*
@@ -958,7 +1136,12 @@ func (tab *Tables) CreateCustomers(table [][][]string) {
 }
 
 func (tab *Tables) CreateLineitems(table [][][]string) {
-	tab.LineItems, tab.MaxOrderLineitems = createLineitemTable(table[LINEITEM], len(tab.Orders)-1)
+	if tab.NOrders == 0 {
+		tab.NOrders = len(tab.Orders) - 1
+	}
+	//tmpCreateLineItemTableNoPointer(table[LINEITEM], tab.NOrders)
+	//tab.LineItems, tab.MaxOrderLineitems = createLineitemTable(table[LINEITEM], tab.NOrders)
+	tab.LineItems, tab.MaxOrderLineitems = createLineitemTableRoutines(table[LINEITEM], tab.NOrders)
 }
 
 func (tab *Tables) CreateNations(table [][][]string) {

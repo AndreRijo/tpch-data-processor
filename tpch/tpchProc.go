@@ -65,7 +65,8 @@ func (data *TpchData) PrepareBaseData() (returnTimes TableReadingTimes) {
 	go data.ProcessBaseData()
 	data.ReadBaseData()
 	data.Tables.NationsByRegion = CreateNationsByRegionTable(data.Tables.Nations, data.Tables.Regions)
-	data.Tables.SortedNationsName, data.Tables.SortedNationsNameByRegion = CreateSortedNations(data.Tables.Nations)
+	data.Tables.SortedNationsName, data.Tables.SortedNationsIds,
+		data.Tables.SortedNationsIdByRegionToFull, data.Tables.SortedNationIdsByRegion = CreateSortedNations(data.Tables.Nations)
 	return times
 }
 
@@ -83,7 +84,7 @@ func (data *TpchData) PrepareBaseData() {
 */
 
 func (data *TpchData) PrepVars() {
-	times = TableReadingTimes{StartTime: time.Now().UnixNano()}
+	times = TableReadingTimes{StartTime: time.Now().UnixNano() / 1000000}
 	scaleFactorS := strconv.FormatFloat(data.Sf, 'f', -1, 64)
 	TableFolder, UpdFolder = data.DataLoc+fmt.Sprintf(TableFormat, scaleFactorS), data.DataLoc+fmt.Sprintf(UpdFormat, scaleFactorS)
 	UpdCompleteFilename = [3]string{UpdFolder + UpdsNames[0] + UpdExtension, UpdFolder + UpdsNames[1] + UpdExtension,
@@ -148,7 +149,7 @@ func (data *TpchData) ReadHeaders() {
 	times.Header = headerFinish - headerStart
 }
 
-func (data *TpchData) ReadBaseData() {
+/*func (data *TpchData) ReadBaseData() {
 	start := time.Now().UnixNano() / 1000000
 	data.RawTables = make([][][]string, len(TableNames))
 	//Force these to be read first
@@ -162,7 +163,45 @@ func (data *TpchData) ReadBaseData() {
 	data.readTable(PARTSUPP)
 	data.readTable(PART)
 
-	times.Read = time.Now().UnixNano()/1000000 - start
+	end := time.Now()
+	times.Read = end.UnixNano()/1000000 - start
+	fmt.Printf("[TpchProcs]Finished reading all data files at %s. Read time: %dms\n", end.Format("15:04:05.000"), times.Read)
+}*/
+
+func (data *TpchData) ReadBaseData() {
+	start := time.Now().UnixNano() / 1000000
+	data.RawTables = make([][][]string, len(TableNames))
+	replyChan := make(chan int, len(TableNames))
+	//data.readTableHelper(REGION, replyChan)
+	//data.readTableHelper(NATION, replyChan)
+	data.readTable(REGION) //Force these two to be read first as they will be necessary for others
+	data.readTable(NATION)
+	go data.readTableHelper(CUSTOMER, replyChan)
+	go data.readTableHelper(SUPPLIER, replyChan)
+	go data.readTableHelper(ORDERS, replyChan)
+	go data.readTableHelper(LINEITEM, replyChan)
+	go data.readTableHelper(PARTSUPP, replyChan)
+	go data.readTableHelper(PART, replyChan)
+
+	//Wait for all tables to be read
+	for i := 0; i < len(TableNames)-2; i++ { //REGION and NATION do not use channel.
+		data.ReadChan <- <-replyChan
+	}
+	end := time.Now()
+	times.Read = end.UnixNano()/1000000 - start
+	fmt.Printf("[TpchProc]Finished reading all data files (goroutines) at %s. Read time: %dms. Time since start: %dms\n",
+		end.Format("15:04:05.000"), times.Read, end.UnixNano()/1000000-times.StartTime)
+}
+
+func (data *TpchData) readTableHelper(tableN int, replyChan chan int) {
+	fmt.Println("[TpchProc]Reading", TableNames[tableN], tableN)
+	nEntries := TableEntries[tableN]
+	if TableUsesSF[tableN] {
+		nEntries = int(float64(nEntries) * data.Sf)
+	}
+	data.RawTables[tableN] = ReadTable(TableFolder+TableNames[tableN]+TableExtension, TableParts[tableN], nEntries, data.ToRead[tableN])
+	//Read complete, can now start processing and sending it
+	replyChan <- tableN
 }
 
 func (data *TpchData) readTable(tableN int) {
@@ -189,21 +228,33 @@ func (data *TpchData) ProcessBaseData() {
 }
 */
 
+// Now that lineitem processTable is optimized with goroutines, it's not worth to split this one into goroutines
+// This because readtable for lineitem will always be the last one to finish: so we will process all other tables before we receive lineitems
 func (data *TpchData) ProcessBaseData() {
-	start := time.Now().UnixNano() / 1000000
+	start := int64(0)
+	timeTaken := int64(0) //TODO: Disable this one, just to know for now.
 	for left := len(TableNames); left > 0; left-- {
 		tableN := <-data.ReadChan
+		if start == 0 {
+			start = time.Now().UnixNano() / 1000000
+		}
+		thisTableStart := time.Now().UnixNano() / 1000000
 		fmt.Println("[TpchProc]Creating", TableNames[tableN], tableN)
 		data.processTable(tableN)
+		timeTaken += time.Now().UnixNano()/1000000 - thisTableStart
 		fmt.Printf("[TpchProc]Sending to chan that table %d is complete. Size of channel: %d\n", tableN, cap(data.ProcChan))
 		if left == 1 { //Last table. We want to ensure we create the following entries before notifying the channel.
 			data.Tables.NationsByRegion = CreateNationsByRegionTable(data.Tables.Nations, data.Tables.Regions)
-			data.Tables.SortedNationsName, data.Tables.SortedNationsNameByRegion = CreateSortedNations(data.Tables.Nations)
+			data.Tables.SortedNationsName, data.Tables.SortedNationsIds,
+				data.Tables.SortedNationsIdByRegionToFull, data.Tables.SortedNationIdsByRegion = CreateSortedNations(data.Tables.Nations)
+			data.Tables.ColorsOfPart = CreateColorsOfParts(data.Tables.Parts)
 		}
 		data.ProcChan <- tableN
 	}
-	fmt.Println("[TpchProc]Finished processing all tables")
-	times.ClientTables = time.Now().UnixNano()/1000000 - start
+	end := time.Now()
+	times.ClientTables = end.UnixNano()/1000000 - start
+	fmt.Printf("[TpchProc]Finished processing all tables at %s. Took %dms. Actual time spent processing: %dms. Time since start: %dms\n",
+		end.Format("15:04:05.000"), times.ClientTables, timeTaken, end.UnixNano()/1000000-times.StartTime)
 }
 
 func (data *TpchData) processTable(tableN int) {

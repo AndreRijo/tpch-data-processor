@@ -6,13 +6,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
 	colSeparator = '|'
 )
 
-func ReadTable(fileLoc string, nParts int, nEntries int, toRead []int8) (tableBuf [][]string) {
+/*func ReadTable(fileLoc string, nParts int, nEntries int, toRead []int8) (tableBuf [][]string) {
 	fmt.Println("[TableReader]Reading tables at: ", fileLoc)
 	if file, err := getFile(fileLoc); err == nil {
 		defer file.Close()
@@ -24,6 +25,82 @@ func ReadTable(fileLoc string, nParts int, nEntries int, toRead []int8) (tableBu
 		}
 	}
 	return
+}*/
+
+func ReadTable(fileLoc string, nParts int, nEntries int, toRead []int8) (tableBuf [][]string) {
+	fmt.Println("[TableReader]Reading tables at: ", fileLoc)
+	start := time.Now().UnixNano()
+	timeSplitEnd, readEnd := int64(0), int64(0)
+	if fileData, err := fastGetFile(fileLoc); err == nil {
+		readEnd = time.Now().UnixNano()
+		tableBuf = make([][]string, nEntries, nEntries)
+		lines := strings.Split(string(fileData), "\n")
+		timeSplitEnd = time.Now().UnixNano()
+		if len(lines) > 200000 {
+			nRoutines := len(lines) / 200000
+			linesPerRoutine := len(lines) / nRoutines
+			fmt.Printf("[ReadTable]Using %d routines to read %d lines.\n", nRoutines, len(lines))
+			replyChan := make(chan bool, nRoutines)
+			for i := 0; i < nRoutines-1; i++ {
+				go processLineRoutine(lines[i*linesPerRoutine:(i+1)*linesPerRoutine], nParts, toRead, tableBuf[i*linesPerRoutine:(i+1)*linesPerRoutine], replyChan)
+			}
+			if len(lines)%100000 != 0 {
+				go processLineRoutine(lines[(nRoutines-1)*linesPerRoutine:], nParts, toRead, tableBuf[(nRoutines-1)*linesPerRoutine:], replyChan)
+			}
+			for i := 0; i < nRoutines; i++ {
+				<-replyChan
+			}
+		} else {
+			for i, line := range lines {
+				if len(line) > 0 {
+					tableBuf[i] = processLine(line, nParts, toRead)
+				}
+			}
+		}
+		/*for i, line := range lines {
+			if len(line) > 0 {
+				tableBuf[i] = tmpProcLine(line, nParts, toRead)
+			}
+		}*/
+	}
+	end := time.Now().UnixNano()
+	totalDur, readDur, splitDur, procDur := (end-start)/1000000, (readEnd-start)/1000000, (timeSplitEnd-readEnd)/1000000, (end-timeSplitEnd)/1000000
+	fmt.Printf("[TableReader]Read %d lines in %d (read %d, split %d, proc %d) ms.\n", len(tableBuf), totalDur, readDur, splitDur, procDur)
+	return
+}
+
+func fastGetFile(fileLoc string) (data []byte, err error) {
+	data, err = os.ReadFile(fileLoc)
+	if err != nil {
+		fmt.Println("Failed to open and read file", fileLoc, "with err", err, "Retrying...")
+		nAttemps := 0
+		for err != nil && nAttemps < 2 {
+			time.Sleep(1 * time.Millisecond)
+			data, err = os.ReadFile(fileLoc)
+			nAttemps++
+		}
+		if err != nil {
+			fmt.Println("Failed to open and read file", fileLoc, "with err", err, "after 3 attempts.")
+			panic(err)
+		}
+	}
+	return
+}
+
+func tmpProcLine(line string, nParts int, toRead []int8) (result []string) {
+	return []string{line}
+}
+
+func processLineRoutine(lines []string, nParts int, toRead []int8, result [][]string, replyChan chan bool) {
+	if len(lines) > 500000 {
+		fmt.Printf("[tableReader]A single routine is processing more than 500000 lines! Should only happen once.")
+	}
+	for i, line := range lines {
+		if len(line) > 0 {
+			result[i] = processLine(line, nParts, toRead)
+		}
+	}
+	replyChan <- true
 }
 
 func processLine(line string, nParts int, toRead []int8) (result []string) {
@@ -55,7 +132,8 @@ func processLine(line string, nParts int, toRead []int8) (result []string) {
 }
 
 func ReadHeaders(headerLoc string, nTables int) (headers [][]string, keys [][]int, toRead [][]int8) {
-	if file, err := getFile(headerLoc); err == nil {
+	file, err := getFile(headerLoc)
+	if err == nil {
 		defer file.Close()
 		//table -> array of fieldNames
 		headers = make([][]string, nTables)
@@ -70,6 +148,10 @@ func ReadHeaders(headerLoc string, nTables int) (headers [][]string, keys [][]in
 		for scanner.Scan() {
 			processHeaderLine(scanner.Text(), headers, toRead, keys, &nLine, &nCol, &nColWithIgnore, &key)
 		}
+		fmt.Printf("[TableReader][ReadHeaders]Headers read successfully at %s.\n", headerLoc)
+	} else {
+		fmt.Printf("[TableReader][ReadHeaders]Failed to open file %s. Error: %v.\n", headerLoc, err)
+		panic(0)
 	}
 	return
 }
@@ -248,7 +330,7 @@ func ReadUpdates(fileLocs []string, nEntries []int, nParts []int, toRead [][]int
 }
 
 // Lineitems has a random number of entries
-func processUpdFile(fileLoc string, nEntries int, nParts int, toRead []int8, tableUpds [][]string) (linesRead int) {
+/*func processUpdFile(fileLoc string, nEntries int, nParts int, toRead []int8, tableUpds [][]string) (linesRead int) {
 	if file, err := getFile(fileLoc); err == nil {
 		defer file.Close()
 		scanner := bufio.NewScanner(file)
@@ -272,13 +354,37 @@ func processDeleteFile(fileLoc string, nEntries int, deleteKeys []string) {
 			deleteKeys[i] = currLine[:len(currLine)-1]
 		}
 	}
+}*/
+
+// Lineitems has a random number of entries
+func processUpdFile(fileLoc string, nEntries, nParts int, toRead []int8, tableUpds [][]string) (linesRead int) {
+	if fileData, err := fastGetFile(fileLoc); err == nil {
+		lines := strings.Split(string(fileData), "\n")
+		for _, line := range lines {
+			if len(line) > 0 {
+				tableUpds[linesRead] = processLine(lines[linesRead], nParts, toRead)
+				linesRead++
+			}
+		}
+	}
+	return
+}
+
+func processDeleteFile(fileLoc string, nEntries int, deleteKeys []string) {
+	if fileData, err := fastGetFile(fileLoc); err == nil {
+		lines := strings.Split(string(fileData), "\n")
+		for i, line := range lines {
+			if len(line) > 0 {
+				deleteKeys[i] = line[:len(line)-2] //Removing the "|" at the end
+			}
+		}
+	}
 }
 
 func getFile(fileLoc string) (file *os.File, err error) {
 	file, err = os.Open(fileLoc)
 	if err != nil {
-		fmt.Println("Failed to open file", fileLoc)
-		fmt.Println(err)
+		fmt.Println("Failed to open file", fileLoc, "with err", err)
 	}
 	return
 }
